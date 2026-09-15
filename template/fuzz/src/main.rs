@@ -88,6 +88,7 @@ pub fn new_test_ext() -> BasicExternalities {
 			authorities: vec![AuraId::from_slice(&[0; 32]).unwrap()],
 		},
 		sudo: fuzzed_runtime::SudoConfig { key: None },
+		blackchain_sudo: Default::default(),
 		transaction_payment: Default::default(),
 		grandpa: Default::default(),
 		manual_seal: Default::default(),

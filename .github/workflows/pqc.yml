@@ -1,0 +1,77 @@
+name: PQC
+
+# Gates the BlackChain post-quantum stack.
+#
+# The upstream `test.yml` runs `cargo test --lib --all` plus the `ts-tests`
+# integration suite; neither meaningfully covers the PQC path, and `ts-tests`
+# still assumes secp256k1 `ecrecover` at 0x01. This workflow is the one that
+# must stay green for the PQC work.
+
+on:
+  push:
+    branches:
+      - master
+      - stable*
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: pqc-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Keep builds off the shared `target/` dir used by local IDE tooling.
+  CARGO_TARGET_DIR: target-pqc
+
+jobs:
+  unit:
+    name: Unit — crypto core, primitives, pallets, precompile
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup show
+          rustup target add wasm32-unknown-unknown
+          rustup component add rust-src
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target-pqc
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      # L0-L4. The crypto core is workspace-excluded, so `cargo test --all`
+      # never reaches it — the runner invokes its manifest explicitly.
+      - name: Run PQC unit suite
+        run: scripts/test-pqc.sh --unit
+
+  e2e:
+    name: End-to-end — live dev node
+    runs-on: ubuntu-latest
+    # The node build dominates; give it room.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup show
+          rustup target add wasm32-unknown-unknown
+          rustup component add rust-src
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target-pqc
+
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      # L5: boots a real node and drives it over JSON-RPC. This is the only
+      # layer that exercises the WASM/host-function boundary and the pool, and
+      # therefore the only place the native↔WASM parity assumption is tested.
+      - name: Run PQC end-to-end suite
+        run: scripts/test-pqc.sh --e2e --release

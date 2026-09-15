@@ -75,6 +75,7 @@ fn transaction_should_increment_nonce() {
 }
 
 #[test]
+#[ignore = "classic ECDSA is disabled on this PQC-only chain (recover_signer returns None), so this upstream test is unreachable. PQC-only rejection is asserted in tests::pqc_only; the PQC equivalent of this scenario lives in tests::blackchain"]
 fn transaction_without_enough_gas_should_not_work() {
 	let (pairs, mut ext) = new_test_ext(1);
 	let alice = &pairs[0];
@@ -102,6 +103,7 @@ fn transaction_without_enough_gas_should_not_work() {
 }
 
 #[test]
+#[ignore = "classic ECDSA is disabled on this PQC-only chain (recover_signer returns None), so this upstream test is unreachable. PQC-only rejection is asserted in tests::pqc_only; the PQC equivalent of this scenario lives in tests::blackchain"]
 fn transaction_with_to_low_nonce_should_not_work() {
 	let (pairs, mut ext) = new_test_ext(1);
 	let alice = &pairs[0];
@@ -159,6 +161,7 @@ fn transaction_with_to_low_nonce_should_not_work() {
 }
 
 #[test]
+#[ignore = "classic ECDSA is disabled on this PQC-only chain (recover_signer returns None), so this upstream test is unreachable. PQC-only rejection is asserted in tests::pqc_only; the PQC equivalent of this scenario lives in tests::blackchain"]
 fn transaction_with_to_hight_nonce_should_fail_in_block() {
 	let (pairs, mut ext) = new_test_ext(1);
 	let alice = &pairs[0];
@@ -185,6 +188,7 @@ fn transaction_with_to_hight_nonce_should_fail_in_block() {
 }
 
 #[test]
+#[ignore = "classic ECDSA is disabled on this PQC-only chain (recover_signer returns None), so this upstream test is unreachable. PQC-only rejection is asserted in tests::pqc_only; the PQC equivalent of this scenario lives in tests::blackchain"]
 fn transaction_with_invalid_chain_id_should_fail_in_block() {
 	let (pairs, mut ext) = new_test_ext(1);
 	let alice = &pairs[0];
@@ -562,6 +566,7 @@ fn event_extra_data_should_be_handle_properly() {
 }
 
 #[test]
+#[ignore = "classic ECDSA is disabled on this PQC-only chain (recover_signer returns None), so this upstream test is unreachable. PQC-only rejection is asserted in tests::pqc_only; the PQC equivalent of this scenario lives in tests::blackchain"]
 fn self_contained_transaction_with_extra_gas_should_adjust_weight_with_post_dispatch() {
 	let (pairs, mut ext) = new_test_ext(1);
 	let alice = &pairs[0];
@@ -704,5 +709,85 @@ fn proof_size_base_cost_should_keep_the_same_in_execution_and_estimate() {
 			estimate_tx_data.proof_size_base_cost(),
 			tx_data.proof_size_base_cost()
 		);
+	});
+}
+
+#[test]
+fn transact_blackchain_check_self_contained_should_work() {
+	let (_pairs, mut ext) = new_test_ext(1);
+	ext.execute_with(|| {
+		let (_mnemonic, private_key) = blackchain_crypto_lib_rust::create_wallet("passphrase").unwrap();
+		let pub_key = private_key.public_key();
+		let address = pub_key.derive_address();
+
+		let mut to_bytes = [0u8; 20];
+		let burn_address = alloy_primitives::Address::ZERO;
+		to_bytes.copy_from_slice(burn_address.as_slice());
+
+		let mut lib_tx = blackchain_crypto_lib_rust::transaction::types::BlackChainTxType {
+			chain_id: 42,
+			nonce: 0,
+			max_priority_fee_per_gas: alloy_primitives::U256::from(1),
+			max_fee_per_gas: alloy_primitives::U256::from(1),
+			gas_limit: 21000,
+			to: Some(burn_address),
+			value: alloy_primitives::U256::from(0),
+			data: alloy_primitives::Bytes::new(),
+			v: Some(alloy_primitives::U256::from(42 * 2 + 35)),
+			r: Some(alloy_primitives::U256::ZERO),
+			s: Some(alloy_primitives::U256::ZERO),
+			pqc_signature: None,
+			pub_key: None,
+		};
+
+		blackchain_crypto_lib_rust::sign_transaction(&mut lib_tx, &private_key).unwrap();
+
+		let transaction = crate::BlackChainTransaction {
+			chain_id: lib_tx.chain_id,
+			nonce: lib_tx.nonce,
+			max_priority_fee_per_gas: lib_tx.max_priority_fee_per_gas.to_be_bytes(),
+			max_fee_per_gas: lib_tx.max_fee_per_gas.to_be_bytes(),
+			gas_limit: lib_tx.gas_limit,
+			to: to_bytes,
+			is_create: false,
+			value: lib_tx.value.to_be_bytes(),
+			input: lib_tx.data.to_vec(),
+			v: lib_tx.v.map(|v| v.to::<u64>()).unwrap_or(0),
+			r: [0u8; 32],
+			s: [0u8; 32],
+			pqc_signature: lib_tx.pqc_signature.clone().map(|b| b.to_vec()).unwrap_or_default(),
+			pub_key: lib_tx.pub_key.clone().map(|b| b.to_vec()).unwrap_or_default(),
+		};
+
+		// `transact_blackchain` now enforces the full EVM checks (nonce / base-fee /
+		// balance / chain_id). `check_self_contained` runs a cheap balance/chain_id/
+		// base-fee pre-filter BEFORE the expensive PQC verify (audit CR-2 mempool-DoS
+		// defence), and `validate_self_contained` runs the full pool validation (audit
+		// CR-1). The freshly-generated PQC sender has no genesis balance, so fund it
+		// FIRST — otherwise the tx is (correctly) rejected as `Payment` for being
+		// unable to pay for gas before its signature is even checked.
+		{
+			use frame_support::traits::Currency;
+			use pallet_evm::AddressMapping;
+			let sender_account = <Test as pallet_evm::Config>::AddressMapping::into_account_id(
+				H160::from_slice(address.as_slice()),
+			);
+			let _ = pallet_balances::Pallet::<Test>::make_free_balance_be(
+				&sender_account,
+				1_000_000_000u64,
+			);
+		}
+
+		let call = crate::Call::<Test>::transact_blackchain { transaction };
+		let check_result = call.check_self_contained();
+		assert!(check_result.is_some());
+		let recovered = check_result.unwrap();
+		let recovered_addr = recovered.unwrap();
+		assert_eq!(recovered_addr, H160::from_slice(address.as_slice()));
+
+		let dispatch_info = call.get_dispatch_info();
+		let validation_result = call.validate_self_contained(&recovered_addr, &dispatch_info, 0);
+		assert!(validation_result.is_some());
+		assert_ok!(validation_result.unwrap());
 	});
 }

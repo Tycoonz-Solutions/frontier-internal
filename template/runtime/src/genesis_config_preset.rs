@@ -106,6 +106,12 @@ fn testnet_genesis(
 		sudo: SudoConfig {
 			key: Some(sudo_key),
 		},
+		// PQC-authenticated admin key (index-0 dev PQC wallet) — restores the
+		// upgrade/governance path via pallet-blackchain-sudo.
+		blackchain_sudo: pallet_blackchain_sudo::GenesisConfig {
+			admin_key: Some(H160(hex!("ff0341100577b6cf676cc8fb8d1bf654b0a478ba"))),
+			..Default::default()
+		},
 		transaction_payment: Default::default(),
 	};
 

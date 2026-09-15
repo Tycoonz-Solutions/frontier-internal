@@ -30,6 +30,9 @@ use frame_support::{traits::Get, weights::Weight};
 use core::marker::PhantomData;
 
 /// Weight functions for `pallet_evm_precompile_curve25519`.
+// The Curve25519 precompiles were removed for the PQC-only chain, so this generated
+// weight struct is retained (for benchmark parity) but never constructed.
+#[allow(dead_code)]
 pub struct WeightInfo<T>(PhantomData<T>);
 impl<T: frame_system::Config> pallet_evm_precompile_curve25519::WeightInfo for WeightInfo<T> {
 	/// The range of component `n` is `[1, 10]`.

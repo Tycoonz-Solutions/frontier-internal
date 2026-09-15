@@ -27,7 +27,23 @@
 	clippy::large_enum_variant,
 	clippy::useless_conversion
 )]
+#![deny(clippy::unwrap_used)]
+#![deny(clippy::expect_used)]
+// Production code must handle `Result`/`Option` explicitly (the denies above), but the mock
+// runtime and unit tests legitimately use `unwrap`/`expect` and complex tuple types. Relax
+// those lints for test builds only; this is inherited by every `#[cfg(test)]` module.
+#![cfg_attr(
+	test,
+	allow(clippy::unwrap_used, clippy::expect_used, clippy::type_complexity)
+)]
 #![warn(unused_crate_dependencies)]
+
+use pallet_ethereum_blackchain_hf as _;
+// `frame-benchmarking` is an optional dependency only present under the
+// `runtime-benchmarks` feature; gate the unused-dep suppressor accordingly so the
+// plain (non-benchmark) WASM runtime build still compiles.
+#[cfg(feature = "runtime-benchmarks")]
+use frame_benchmarking as _;
 
 extern crate alloc;
 
@@ -35,9 +51,14 @@ extern crate alloc;
 mod mock;
 #[cfg(all(feature = "std", test))]
 mod tests;
+#[cfg(feature = "runtime-benchmarks")]
+mod benchmarking;
+pub mod weights;
+pub use weights::BlackChainWeightInfo;
 
 use alloc::{vec, vec::Vec};
 use core::marker::PhantomData;
+use ethereum::eip2930::TransactionSignature as EIP1559Signature;
 pub use ethereum::{
 	AccessListItem, BlockV3 as Block, LegacyTransactionMessage, Log, ReceiptV4 as Receipt,
 	TransactionAction, TransactionV3 as Transaction,
@@ -46,6 +67,35 @@ use ethereum_types::{Bloom, BloomInput, H160, H256, H64, U256};
 use evm::ExitReason;
 use scale_codec::{Decode, DecodeWithMemTracking, Encode, MaxEncodedLen};
 use scale_info::TypeInfo;
+
+// BlackChain PQC on-chain transaction type.
+// Defined here (not imported) so WASM never links the crypto library.
+// Only the std path in recover_blackchain_signer uses fp-blackchain-crypto.
+#[derive(Clone, PartialEq, Eq, Encode, Decode, DecodeWithMemTracking, TypeInfo)]
+#[cfg_attr(feature = "std", derive(Debug))]
+pub struct BlackChainTransaction {
+	pub chain_id: u64,
+	pub nonce: u64,
+	/// EIP-1559 priority fee (U256 big-endian).
+	pub max_priority_fee_per_gas: [u8; 32],
+	/// EIP-1559 max fee (U256 big-endian).
+	pub max_fee_per_gas: [u8; 32],
+	pub gas_limit: u64,
+	/// Recipient (20 bytes). Ignored when `is_create = true`.
+	pub to: [u8; 20],
+	pub is_create: bool,
+	/// Value (U256 big-endian).
+	pub value: [u8; 32],
+	pub input: alloc::vec::Vec<u8>,
+	/// EIP-155 placeholder: chain_id * 2 + 35.
+	pub v: u64,
+	pub r: [u8; 32],
+	pub s: [u8; 32],
+	/// Composite PQC signature: [Dil5 ‖ P-521 ‖ Ed448].
+	pub pqc_signature: alloc::vec::Vec<u8>,
+	/// Composite public key: [Dil5 pk ‖ P-521 pk ‖ Ed448 pk] (2782 B).
+	pub pub_key: alloc::vec::Vec<u8>,
+}
 // Substrate
 use frame_support::{
 	dispatch::{
@@ -116,7 +166,10 @@ where
 	T::RuntimeCall: Dispatchable<Info = DispatchInfo, PostInfo = PostDispatchInfo>,
 {
 	pub fn is_self_contained(&self) -> bool {
-		matches!(self, Call::transact { .. })
+		matches!(
+			self,
+			Call::transact { .. } | Call::transact_blackchain { .. }
+		)
 	}
 
 	pub fn check_self_contained(&self) -> Option<Result<H160, TransactionValidityError>> {
@@ -125,10 +178,69 @@ where
 				let origin = Pallet::<T>::recover_signer(transaction).ok_or(
 					InvalidTransaction::Custom(TransactionValidationError::InvalidSignature as u8),
 				)?;
-
 				Ok(origin)
 			};
+			Some(check())
+		} else if let Call::transact_blackchain { transaction } = self {
+			// ── Fast O(1) structural pre-check gate (Mempool DoS Prevention) ─────
+			// Perform cheap size validation BEFORE invoking expensive composite PQC
+			// signature verification. Junk or malformed extrinsics drop in nanoseconds.
+			// All three sub-signatures are fixed-width (ML-DSA-87 4627 ‖ P-521 132 ‖
+			// Ed448 114), so a well-formed composite signature is EXACTLY 4873 bytes —
+			// the crypto library rejects any other length (anti-malleability/padding).
+			const COMPOSITE_PK_SIZE: usize = 2782;
+			const COMPOSITE_SIG_SIZE: usize = 4873;
 
+			if transaction.pub_key.len() != COMPOSITE_PK_SIZE
+				|| transaction.pqc_signature.len() != COMPOSITE_SIG_SIZE
+			{
+				return Some(Err(InvalidTransaction::Custom(
+					TransactionValidationError::InvalidSignature as u8,
+				)
+				.into()));
+			}
+
+			// ── Cheap economic pre-filter BEFORE the expensive PQC verify (CR-2) ─
+			// The claimed sender is keccak256(pub_key)[12..], derivable WITHOUT
+			// verifying the ~1.6 ms composite signature. Reject unpayable / wrong-
+			// chain / underpriced spam here in microseconds so a zero-balance
+			// attacker cannot force every node to run Dilithium5+P-521+Ed448 for a
+			// transaction that could never pay. If the signature later proves
+			// invalid we reject anyway; if valid, the recovered sender equals this
+			// claimed address (asserted below), so vetting it now is sound.
+			let claimed_origin =
+				H160::from_slice(&sp_io::hashing::keccak_256(&transaction.pub_key)[12..]);
+			match Pallet::<T>::blackchain_to_evm_transaction(transaction) {
+				Some(evm_tx) => {
+					if let Err(e) =
+						Pallet::<T>::blackchain_precheck_economics(claimed_origin, &evm_tx)
+					{
+						return Some(Err(e));
+					}
+				}
+				None => {
+					return Some(Err(InvalidTransaction::Custom(
+						TransactionValidationError::InvalidSignature as u8,
+					)
+					.into()))
+				}
+			}
+
+			// Expensive path: full composite verification + sender recovery.
+			let check = || {
+				let origin = Pallet::<T>::recover_blackchain_signer(transaction).ok_or(
+					InvalidTransaction::Custom(TransactionValidationError::InvalidSignature as u8),
+				)?;
+				// The economically-vetted claimed address MUST equal the verified
+				// sender — otherwise the pre-filter checked a different account.
+				if origin != claimed_origin {
+					return Err(InvalidTransaction::Custom(
+						TransactionValidationError::InvalidSignature as u8,
+					)
+					.into());
+				}
+				Ok(origin)
+			};
 			Some(check())
 		} else {
 			None
@@ -148,11 +260,87 @@ where
 				}) {
 				return Some(Err(e));
 			}
-
 			Some(Pallet::<T>::validate_transaction_in_block(
 				*origin,
 				transaction,
 			))
+	} else if let Call::transact_blackchain { transaction } = self {
+			// ── WASM-safe binding check ─────────────────────────────────────────
+			// Full Dilithium5+P521+Ed448 verification runs ONLY in native (std)
+			// via check_self_contained.  In WASM we cannot re-run the same math,
+			// but we CAN perform structural checks that prevent a malicious block
+			// producer from injecting a forged extrinsic that bypasses the pool:
+			//
+			//  1. pub_key must be exactly COMPOSITE_PK_SIZE bytes — any other
+			//     length is immediately invalid.
+			//  2. pqc_signature must be at least the minimum composite length.
+			//  3. keccak256(pub_key)[12..] must equal *origin* — this pins the
+			//     public key to the sender address that native check already
+			//     validated.  An attacker who swaps in a different pub_key would
+			//     produce a different address and this check would reject it.
+			// Hardcoded protocol constants — valid in both std and WASM (no_std).
+		// COMPOSITE_PK_SIZE  = 2782: ML-DSA-87-pk(2592) + P521-pk(133) + Ed448-pk(57)
+		// COMPOSITE_SIG_SIZE = 4873: ML-DSA-87-sig(4627) + P521-sig(132, fixed r‖s) + Ed448-sig(114)
+		const COMPOSITE_PK_SIZE: usize = 2782;
+		const COMPOSITE_SIG_SIZE: usize = 4873;
+
+			// Check 1: public key structural size
+			if transaction.pub_key.len() != COMPOSITE_PK_SIZE {
+				return Some(Err(InvalidTransaction::Custom(
+					TransactionValidationError::InvalidSignature as u8,
+				)
+				.into()));
+			}
+
+			// Check 2: signature must be exactly the fixed composite size
+			if transaction.pqc_signature.len() != COMPOSITE_SIG_SIZE {
+				return Some(Err(InvalidTransaction::Custom(
+					TransactionValidationError::InvalidSignature as u8,
+				)
+				.into()));
+			}
+
+			// Check 3: pub_key must hash to the claimed origin address
+			let derived_hash = sp_io::hashing::keccak_256(&transaction.pub_key);
+			let derived_addr = H160::from_slice(&derived_hash[12..]);
+			if derived_addr != *origin {
+				return Some(Err(InvalidTransaction::Custom(
+					TransactionValidationError::InvalidSignature as u8,
+				)
+				.into()));
+			}
+
+			// Weight check
+			if let Err(e) =
+				CheckWeight::<T>::do_validate(dispatch_info, len).and_then(|(_, next_len)| {
+					CheckWeight::<T>::do_prepare(dispatch_info, len, next_len)
+				}) {
+				return Some(Err(e));
+			}
+
+			// ── STF validation (replay / double-spend protection) ───────────────
+			// This is the CONSENSUS-CRITICAL check the classic `transact` branch
+			// performs above via `validate_transaction_in_block`. Without it the
+			// blackchain path applies with `validate = false` and the EVM runner
+			// never checks nonce / balance / base-fee / chain_id — so any validly
+			// signed transfer could be replayed (a stale nonce would execute again).
+			//
+			// We reconstruct the byte-identical EVM transaction that dispatch will
+			// execute and run the same full validation. `validate_transaction_in_block`
+			// requires `tx.nonce == account.nonce` exactly, rejecting both stale
+			// (already-spent) and future nonces, and also enforces chain_id, base-fee
+			// and balance. This runs in native (pool import) AND WASM (block execution),
+			// so a malicious block author cannot smuggle a stale-nonce tx past it.
+			let evm_tx = match Pallet::<T>::blackchain_to_evm_transaction(transaction) {
+				Some(tx) => tx,
+				None => {
+					return Some(Err(InvalidTransaction::Custom(
+						TransactionValidationError::InvalidSignature as u8,
+					)
+					.into()))
+				}
+			};
+			Some(Pallet::<T>::validate_transaction_in_block(*origin, &evm_tx))
 		} else {
 			None
 		}
@@ -168,11 +356,31 @@ where
 			if let Err(e) = CheckWeight::<T>::do_validate(dispatch_info, len) {
 				return Some(Err(e));
 			}
-
 			Some(Pallet::<T>::validate_transaction_in_pool(
 				*origin,
 				transaction,
 			))
+		} else if let Call::transact_blackchain { transaction } = self {
+			if let Err(e) = CheckWeight::<T>::do_validate(dispatch_info, len) {
+				return Some(Err(e));
+			}
+
+			// Signature was already checked in check_self_contained. Now run the full
+			// pool-level validation on the byte-identical EVM transaction: stale-nonce
+			// rejection, base-fee, balance, chain_id and gas-limit checks, plus the
+			// provides/requires nonce tags used for mempool ordering. This mirrors the
+			// classic `transact` branch and drops replayed / unpayable / junk txs at
+			// admission instead of letting them sit in the mempool.
+			let evm_tx = match Pallet::<T>::blackchain_to_evm_transaction(transaction) {
+				Some(tx) => tx,
+				None => {
+					return Some(Err(InvalidTransaction::Custom(
+						TransactionValidationError::InvalidSignature as u8,
+					)
+					.into()))
+				}
+			};
+			Some(Pallet::<T>::validate_transaction_in_pool(*origin, &evm_tx))
 		} else {
 			None
 		}
@@ -189,6 +397,7 @@ pub enum PostLogContent {
 pub use self::pallet::*;
 
 #[frame_support::pallet]
+#[allow(clippy::expect_used)]
 pub mod pallet {
 	use super::*;
 	use frame_support::pallet_prelude::*;
@@ -209,6 +418,12 @@ pub mod pallet {
 		type PostLogContent: Get<PostLogContent>;
 		/// The maximum length of the extra data in the Executed event.
 		type ExtraDataLength: Get<u32>;
+		/// Weight information for BlackChain PQC extrinsics.
+		///
+		/// Implement this using the output of:
+		///   `benchmark pallet --extrinsic=pqc_verify_signature ...`
+		/// Until then, the default `()` implementation uses a conservative placeholder.
+		type BlackChainWeightInfo: BlackChainWeightInfo;
 	}
 
 	pub mod config_preludes {
@@ -232,6 +447,8 @@ pub mod pallet {
 			type StateRoot = IntermediateStateRoot<Self::Version>;
 			type PostLogContent = PostBlockAndTxnHashes;
 			type ExtraDataLength = ConstU32<30>;
+			// Use the () fallback weight for tests — no benchmarking needed.
+			type BlackChainWeightInfo = ();
 		}
 	}
 
@@ -269,13 +486,21 @@ pub mod pallet {
 				let PreLog::Block(block) = log;
 
 				for transaction in block.transactions {
+					// CONSENSUS SAFETY: Pre-log block import executes transactions from a pre-sealed
+					// block digest. If signature recovery or transaction validation fails here,
+					// continuing would cause silent state-root divergence across nodes.
+					// Halting execution via expect() is the required Substrate fail-safe.
+					#[allow(clippy::expect_used)]
 					let source = Self::recover_signer(&transaction).expect(
 						"pre-block transaction signature invalid; the block cannot be built",
 					);
 
+					#[allow(clippy::expect_used)]
 					Self::validate_transaction_in_block(source, &transaction).expect(
 						"pre-block transaction verification failed; the block cannot be built",
 					);
+
+					#[allow(clippy::expect_used)]
 					let (r, _) = Self::apply_validated_transaction(source, transaction, None)
 						.expect("pre-block apply transaction failed; the block cannot be built");
 
@@ -299,6 +524,20 @@ pub mod pallet {
 			T::DbWeight::get().writes(1)
 		}
 	}
+
+	/// Conservative upper-bound on the ref_time cost of verifying one composite PQC signature
+	/// (Dilithium5 + NIST P-521 + Ed448).
+	///
+	/// **This value is a placeholder and MUST be replaced with actual `frame-benchmarking`
+	/// measurements on target validator hardware before any production deployment.**
+	///
+	/// Rough estimates from dev hardware (Apple M-series):
+	///   Dilithium5 verify ≈ 0.5 ms, P-521 verify ≈ 1.5 ms, Ed448 verify ≈ 2.5 ms
+	///   Total ≈ ~5 ms → 500_000 Weight ref_time units (at 1 picosecond per unit)
+	///
+	/// Set 10× conservatively (5_000_000) to leave a margin against slower hardware
+	/// and WASM overhead until real benchmarks are available.
+	pub const PQC_VERIFY_OVERHEAD_REF_TIME: u64 = 5_000_000;
 
 	#[pallet::call]
 	impl<T: Config> Pallet<T>
@@ -327,6 +566,75 @@ pub mod pallet {
 
 			Self::apply_validated_transaction(source, transaction, None)
 				.map(|(post_info, _)| post_info)
+		}
+
+		/// Transact a BlackChain hybrid PQC transaction (Option B wire format).
+		///
+		/// This extrinsic is the production-grade entry point for submitting
+		/// BlackChain transactions signed with the Dilithium5 + P-521 + Ed448
+		/// composite scheme.
+		///
+		/// Classic secp256k1 ECDSA is NOT used.  The sender address is derived
+		/// from the composite public key embedded in the transaction.
+		#[pallet::call_index(1)]
+		#[pallet::weight({
+			let without_base_extrinsic_weight = true;
+			let evm_weight = <T as pallet_evm::Config>::GasWeightMapping::gas_to_weight(
+				transaction.gas_limit,
+				without_base_extrinsic_weight,
+			);
+			// Add the PQC signature-verification overhead on top of EVM gas cost.
+			// This uses T::BlackChainWeightInfo::pqc_verify_signature() which is
+			// populated from `frame-benchmarking` measurements. Run:
+			//   benchmark pallet --extrinsic=pqc_verify_signature
+			// and set type BlackChainWeightInfo = SubstrateWeight<Runtime> in your runtime.
+			evm_weight.saturating_add(T::BlackChainWeightInfo::pqc_verify_signature())
+		})]
+		pub fn transact_blackchain(
+			origin: OriginFor<T>,
+			transaction: BlackChainTransaction,
+		) -> DispatchResultWithPostInfo {
+			// Prevent transact when PreLog already exists
+			ensure!(
+				fp_consensus::find_pre_log(&frame_system::Pallet::<T>::digest()).is_err(),
+				Error::<T>::PreLogExists,
+			);
+
+			// The composite signature was ALREADY verified in `check_self_contained`
+			// (which runs at pool admission AND during block import), and the verified
+			// sender is carried by the self-contained origin. Re-running the full
+			// Dilithium5 + P-521 + Ed448 verification here would DOUBLE the ~1.6 ms
+			// verify cost per transaction during block import, while the declared
+			// weight accounts for only one verify (audit HI-6). So we trust the origin
+			// and confirm — with a cheap keccak, NOT a second signature verification —
+			// that the transaction's public key hashes to it. This is exactly the pin
+			// the WASM `pre_dispatch_self_contained` already enforces, so it can never
+			// fail for a transaction that reached dispatch through the self-contained
+			// path; it is defence-in-depth that costs microseconds, not milliseconds.
+			let source = ensure_ethereum_transaction(origin)?;
+			let derived =
+				H160::from_slice(&sp_io::hashing::keccak_256(&transaction.pub_key)[12..]);
+			ensure!(derived == source, Error::<T>::InvalidSignature);
+
+			// Build an equivalent Ethereum EIP-1559 transaction for the EVM pipeline.
+			// The EVM runner does not care about the signature format; it only needs
+			// the execution parameters (to, value, gas, data). This MUST be identical
+			// to the transaction validated in `pre_dispatch_self_contained`, so both
+			// share `blackchain_to_evm_transaction`.
+			//
+			// Nonce / balance / base-fee / chain_id are enforced in
+			// `pre_dispatch_self_contained` (the STF gate that runs before this
+			// dispatch), mirroring the classic `transact` path. `transact_blackchain`
+			// requires a `RawOrigin::EthereumTransaction` origin, which only the
+			// self-contained machinery supplies, so it can never be dispatched
+			// bypassing that gate.
+			let evm_tx = Self::blackchain_to_evm_transaction(&transaction).ok_or(
+				DispatchError::Other(
+					"BlackChain: failed to construct derived EIP1559 placeholder signature",
+				),
+			)?;
+
+			Self::apply_validated_transaction(source, evm_tx, None).map(|(post_info, _)| post_info)
 		}
 	}
 
@@ -406,44 +714,222 @@ impl<T: Config> Pallet<T> {
 	}
 
 	fn recover_signer(transaction: &Transaction) -> Option<H160> {
-		let mut sig = [0u8; 65];
-		let mut msg = [0u8; 32];
+		// All classic Ethereum transaction variants use secp256k1 ECDSA.
+		// In a BlackChain-only network these variants are NOT accepted — returning
+		// None causes the transaction to be rejected as InvalidSignature.
+		//
+		// NOTE: to accept both classic and BlackChain transactions, change the
+		// arms below to call sp_io::crypto::secp256k1_ecdsa_recover instead.
 		match transaction {
-			Transaction::Legacy(t) => {
-				sig[0..32].copy_from_slice(&t.signature.r()[..]);
-				sig[32..64].copy_from_slice(&t.signature.s()[..]);
-				sig[64] = t.signature.standard_v();
-				msg.copy_from_slice(
-					&ethereum::LegacyTransactionMessage::from(t.clone()).hash()[..],
-				);
-			}
-			Transaction::EIP2930(t) => {
-				sig[0..32].copy_from_slice(&t.signature.r()[..]);
-				sig[32..64].copy_from_slice(&t.signature.s()[..]);
-				sig[64] = t.signature.odd_y_parity() as u8;
-				msg.copy_from_slice(
-					&ethereum::EIP2930TransactionMessage::from(t.clone()).hash()[..],
-				);
-			}
-			Transaction::EIP1559(t) => {
-				sig[0..32].copy_from_slice(&t.signature.r()[..]);
-				sig[32..64].copy_from_slice(&t.signature.s()[..]);
-				sig[64] = t.signature.odd_y_parity() as u8;
-				msg.copy_from_slice(
-					&ethereum::EIP1559TransactionMessage::from(t.clone()).hash()[..],
-				);
-			}
-			Transaction::EIP7702(t) => {
-				sig[0..32].copy_from_slice(&t.signature.r()[..]);
-				sig[32..64].copy_from_slice(&t.signature.s()[..]);
-				sig[64] = t.signature.odd_y_parity() as u8;
-				msg.copy_from_slice(
-					&ethereum::EIP7702TransactionMessage::from(t.clone()).hash()[..],
-				);
+			Transaction::Legacy(_)
+			| Transaction::EIP2930(_)
+			| Transaction::EIP1559(_)
+			| Transaction::EIP7702(_) => {
+				// Classic ECDSA transactions are rejected on a BlackChain-only node.
+				None
 			}
 		}
-		let pubkey = sp_io::crypto::secp256k1_ecdsa_recover(&sig, &msg).ok()?;
-		Some(H160::from(H256::from(sp_io::hashing::keccak_256(&pubkey))))
+	}
+
+	/// Recovers the sender address from a BlackChain hybrid PQC transaction.
+	///
+	/// ## Execution contexts
+	///
+	/// - **Native / std** (`check_self_contained`, transaction pool): Runs the full
+	///   composite signature verification via `verify_blackchain_tx()` from the library.
+	///   All three sub-signatures (Dilithium5 + P-521 + Ed448) are checked.
+	///
+	/// - **WASM / no_std** (block execution): By the time WASM executes this, the
+	///   native executor has *already* verified the signature in `check_self_contained`.
+	///   We only derive the sender address from the composite public key bytes using
+	///   `keccak_256`, which is available as a host function in WASM.
+	pub fn recover_blackchain_signer(tx: &BlackChainTransaction) -> Option<H160> {
+		#[cfg(feature = "std")]
+		{
+			use alloy_primitives::{
+				Address as AlloyAddress, Bytes as AlloyBytes, U256 as AlloyU256,
+			};
+			use fp_blackchain_crypto::{verify_blackchain_tx, BlackChainTxType};
+
+			let lib_tx = BlackChainTxType {
+				chain_id: tx.chain_id,
+				nonce: tx.nonce,
+				max_priority_fee_per_gas: AlloyU256::from_be_bytes(tx.max_priority_fee_per_gas),
+				max_fee_per_gas: AlloyU256::from_be_bytes(tx.max_fee_per_gas),
+				gas_limit: tx.gas_limit,
+				to: if tx.is_create {
+					None
+				} else {
+					Some(AlloyAddress::from_slice(&tx.to))
+				},
+				value: AlloyU256::from_be_bytes(tx.value),
+				data: AlloyBytes::from(tx.input.clone()),
+				v: Some(AlloyU256::from(tx.v)),
+				r: Some(AlloyU256::ZERO),
+				s: Some(AlloyU256::ZERO),
+				pqc_signature: Some(AlloyBytes::from(tx.pqc_signature.clone())),
+				pub_key: Some(AlloyBytes::from(tx.pub_key.clone())),
+			};
+
+			log::debug!(
+				target: "ethereum",
+				"Verifying BlackChain PQC transaction: chain_id={}, nonce={}, gas_limit={}, pub_key_len={}, sig_len={}",
+				tx.chain_id,
+				tx.nonce,
+				tx.gas_limit,
+				tx.pub_key.len(),
+				tx.pqc_signature.len()
+			);
+
+			match verify_blackchain_tx(&lib_tx) {
+				Ok(alloy_addr) => {
+					let address = H160::from_slice(alloy_addr.as_slice());
+					log::info!(
+						target: "ethereum",
+						"Successfully verified BlackChain PQC signature. Recovered sender address: {address:?}"
+					);
+					Some(address)
+				}
+				Err(e) => {
+					log::error!(
+						target: "ethereum",
+						"Failed to verify BlackChain PQC signature: {e:?}"
+					);
+					None
+				}
+			}
+		}
+
+		// WASM executor path:
+		// Full Dilithium5+P-521+Ed448 verification runs on the HOST (native) side
+		// via the `blackchain_crypto::verify_pqc_transaction` host function.
+		//
+		// The entire BlackChainTransaction is SCALE-encoded into a single Vec<u8>
+		// (avoiding all RIType constraints), passed to the host, which decodes,
+		// reconstructs BlackChainTxType, and runs fp_blackchain_crypto::verify_blackchain_tx.
+		//
+		// Returns 20 bytes (H160) on success, empty Vec on failure.
+		#[cfg(not(feature = "std"))]
+		{
+			use pallet_ethereum_blackchain_hf::blackchain_crypto;
+			use scale_codec::Encode;
+
+			let encoded = tx.encode();
+			let result = blackchain_crypto::verify_pqc_transaction(encoded);
+
+			if result.len() == 20 {
+				Some(H160::from_slice(&result))
+			} else {
+				None
+			}
+		}
+	}
+
+	/// Build the equivalent Ethereum EIP-1559 transaction for a BlackChain PQC
+	/// transaction.
+	///
+	/// The EVM pipeline (execution, fee/nonce/balance validation) only needs the
+	/// execution parameters (chain_id, nonce, fees, gas, to, value, data). The
+	/// signature format is irrelevant to it, so we synthesise a deterministic
+	/// placeholder `r`/`s` derived from the composite PQC signature — this gives
+	/// every distinct PQC transaction a unique Ethereum-level hash (a constant
+	/// r/s would collide for two PQC txs sharing the same fields).
+	///
+	/// ⚠ The resulting `r`/`s`/`v` are NON-CRYPTOGRAPHIC PLACEHOLDERS — they are not
+	/// an ECDSA signature over anything. `ecrecover(r,s,v)` on the returned tx yields
+	/// a meaningless address (audit HI-8). The authoritative sender is
+	/// `keccak256(pub_key)[12..]`; explorers/indexers should read `from` from the tx
+	/// status or the `blackchain_getTransactionByHash` RPC (which returns the real
+	/// composite public key + signature), never recover it from `r`/`s`/`v`.
+	///
+	/// This single construction is shared by `pre_dispatch_self_contained`
+	/// (STF nonce/fee/balance/chain_id validation), `validate_self_contained`
+	/// (pool validation) and `transact_blackchain` (dispatch) so all three
+	/// operate on byte-identical transactions — a divergence between validation
+	/// and execution would reopen the replay window this closes.
+	///
+	/// Returns `None` only if the derived placeholder signature cannot be
+	/// constructed (should never happen given the LSB-forcing below).
+	pub fn blackchain_to_evm_transaction(tx: &BlackChainTransaction) -> Option<Transaction> {
+		let action = if tx.is_create {
+			TransactionAction::Create
+		} else {
+			TransactionAction::Call(H160::from_slice(&tx.to))
+		};
+
+		// Construction: sig_hash = keccak256(pqc_signature)
+		//   r = sig_hash with the LSB forced to 1 (guarantees r != 0)
+		//   s = keccak256(r_bytes) with the LSB forced to 1 (guarantees s != 0 and s != r)
+		let sig_hash = sp_io::hashing::keccak_256(&tx.pqc_signature);
+		let mut r_bytes = sig_hash;
+		r_bytes[31] |= 0x01;
+		let mut s_bytes = sp_io::hashing::keccak_256(&r_bytes);
+		s_bytes[31] |= 0x01;
+		let placeholder_sig = EIP1559Signature::new(
+			false,
+			ethereum_types::H256::from_slice(&r_bytes),
+			ethereum_types::H256::from_slice(&s_bytes),
+		)?;
+
+		Some(Transaction::EIP1559(ethereum::EIP1559Transaction {
+			chain_id: tx.chain_id,
+			nonce: U256::from(tx.nonce),
+			max_priority_fee_per_gas: U256::from_big_endian(&tx.max_priority_fee_per_gas),
+			max_fee_per_gas: U256::from_big_endian(&tx.max_fee_per_gas),
+			gas_limit: U256::from(tx.gas_limit),
+			action,
+			value: U256::from_big_endian(&tx.value),
+			input: tx.input.clone(),
+			access_list: vec![],
+			signature: placeholder_sig,
+		}))
+	}
+
+	/// Cheap economic pre-filter for a BlackChain transaction, run BEFORE the
+	/// expensive composite PQC signature verification (mempool CPU-DoS defence,
+	/// audit CR-2).
+	///
+	/// The claimed sender address of a BlackChain tx is `keccak256(pub_key)[12..]`
+	/// and is derivable WITHOUT verifying the signature. That lets us reject spam
+	/// (a zero-balance / wrong-chain / underpriced keypair) using only a couple of
+	/// storage reads and a keccak — instead of forcing every node to burn ~1.6 ms
+	/// on Dilithium5 + P-521 + Ed448 verification for a tx that can never pay.
+	///
+	/// This runs ONLY the three checks that are identical in the pool and in-block
+	/// contexts and are a strict SUBSET of both `validate_transaction_in_pool` and
+	/// `validate_transaction_in_block`: chain_id, base-fee and balance. It
+	/// deliberately omits the nonce check (pool vs block differ; nonce ordering is
+	/// enforced authoritatively later) so it can NEVER reject a transaction that the
+	/// authoritative validation would accept — i.e. it introduces no consensus or
+	/// mempool-behaviour divergence, only an early-out.
+	fn blackchain_precheck_economics(
+		origin: H160,
+		transaction: &Transaction,
+	) -> Result<(), TransactionValidityError> {
+		let transaction_data: TransactionData = transaction.into();
+		let (weight_limit, proof_size_base_cost) = Self::transaction_weight(&transaction_data);
+		let (base_fee, _) = T::FeeCalculator::min_gas_price();
+		let (who, _) = pallet_evm::Pallet::<T>::account_basic(&origin);
+
+		let check = CheckEvmTransaction::<InvalidTransactionWrapper>::new(
+			CheckEvmTransactionConfig {
+				evm_config: T::config(),
+				block_gas_limit: T::BlockGasLimit::get(),
+				base_fee,
+				chain_id: T::ChainId::get(),
+				is_transactional: true,
+			},
+			transaction_data.into(),
+			weight_limit,
+			proof_size_base_cost,
+		);
+		check
+			.with_chain_id()
+			.and_then(|v| v.with_base_fee())
+			.and_then(|v| v.with_balance_for(&who))
+			.map_err(|e| TransactionValidityError::Invalid(e.0))?;
+
+		Ok(())
 	}
 
 	fn store_block(post_log: Option<PostLogContent>, block_number: U256) {
@@ -1052,16 +1538,25 @@ impl<T: Config> Pallet<T> {
 			)
 				.encode())
 		} else {
+			// No legacy BlockV0 present (fresh chain / already migrated). Return an
+			// empty state so `post_migrate_block_v2` skips its assertions. Without this
+			// `else` the function has no value on the None path and fails to compile
+			// under `--features try-runtime` (E0317).
 			Ok(Vec::new())
 		}
 	}
 
 	#[cfg(feature = "try-runtime")]
 	pub fn post_migrate_block_v2(v0_data: Vec<u8>) -> Result<(), &'static str> {
+		// Empty state means `pre_migrate_block_v2` found no legacy BlockV0 (fresh chain
+		// or already migrated), so there is nothing to assert against.
+		if v0_data.is_empty() {
+			return Ok(());
+		}
 		let (v0_number, v0_parent_hash, v0_transaction_len): (U256, H256, u64) = Decode::decode(
 			&mut v0_data.as_slice(),
 		)
-		.expect("the state parameter should be something that was generated by pre_upgrade");
+		.map_err(|_| "the state parameter should be something that was generated by pre_upgrade")?;
 		let item = b"CurrentBlock";
 		let block_v2 = frame_support::storage::migration::get_storage_value::<ethereum::BlockV2>(
 			Self::name().as_bytes(),
@@ -1069,9 +1564,9 @@ impl<T: Config> Pallet<T> {
 			&[],
 		);
 
-		assert!(block_v2.is_some());
-
-		let block_v2 = block_v2.unwrap();
+		let Some(block_v2) = block_v2 else {
+			return Err("BlockV2 storage item missing post migration");
+		};
 		assert_eq!(block_v2.header.number, v0_number);
 		assert_eq!(block_v2.header.parent_hash, v0_parent_hash);
 		assert_eq!(block_v2.transactions.len() as u64, v0_transaction_len);
@@ -1100,6 +1595,13 @@ pub struct IntermediateStateRoot<T>(PhantomData<T>);
 impl<T: Get<RuntimeVersion>> Get<H256> for IntermediateStateRoot<T> {
 	fn get() -> H256 {
 		let version = T::get().state_version();
+		// CONSENSUS SAFETY: the storage root is produced by the same node that runs
+		// this runtime, so it must always decode to a valid H256. If it does not, the
+		// node's environment is fundamentally broken and continuing would embed a
+		// garbage/zero state root into the block header — silently diverging from every
+		// other validator. Halting here is the required fail-safe; returning a default
+		// value would poison consensus. (Overrides crate-level `deny(expect_used)`.)
+		#[allow(clippy::expect_used)]
 		H256::decode(&mut &sp_io::storage::root(version)[..])
 			.expect("Node is configured to use the same hash; qed")
 	}

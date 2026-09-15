@@ -9,6 +9,7 @@ use sc_client_api::{Backend as BackendT, BlockBackend};
 use sc_consensus::{BasicQueue, BoxBlockImport};
 use sc_consensus_grandpa::BlockNumberOps;
 use sc_executor::HostFunctions as HostFunctionsT;
+use pallet_ethereum_blackchain_hf::blackchain_crypto::HostFunctions as BlackchainHostFunctions;
 use sc_network_sync::strategy::warp::{WarpSyncConfig, WarpSyncProvider};
 use sc_service::{error::Error as ServiceError, Configuration, PartialComponents, TaskManager};
 use sc_telemetry::{Telemetry, TelemetryHandle, TelemetryWorker};
@@ -40,12 +41,14 @@ pub type HostFunctions = (
 	sp_io::SubstrateHostFunctions,
 	frame_benchmarking::benchmarking::HostFunctions,
 	cumulus_primitives_proof_size_hostfunction::storage_proof_size::HostFunctions,
+	BlackchainHostFunctions,
 );
 /// Otherwise we use empty host functions for ext host functions.
 #[cfg(not(feature = "runtime-benchmarks"))]
 pub type HostFunctions = (
 	sp_io::SubstrateHostFunctions,
 	cumulus_primitives_proof_size_hostfunction::storage_proof_size::HostFunctions,
+	BlackchainHostFunctions,
 );
 
 pub type Backend = FullBackend<Block>;

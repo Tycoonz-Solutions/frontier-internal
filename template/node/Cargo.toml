@@ -20,6 +20,7 @@ hex-literal = { workspace = true }
 jsonrpsee = { workspace = true, features = ["server", "macros"] }
 log = { workspace = true }
 scale-codec = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true, features = ["arbitrary_precision"] }
 
 # Substrate
@@ -78,10 +79,13 @@ fp-account = { workspace = true }
 fp-dynamic-fee = { workspace = true, features = ["default"] }
 fp-evm = { workspace = true, features = ["default"] }
 fp-rpc = { workspace = true, features = ["default"] }
+fp-blackchain-rpc = { workspace = true, features = ["default"] }
 frontier-template-runtime = { workspace = true, features = ["std"] }
 
 # Cumulus primitives
 cumulus-primitives-proof-size-hostfunction = { workspace = true }
+# BlackChain PQC host functions — registered with the WASM executor (native std required)
+pallet-ethereum-blackchain-hf = { workspace = true, features = ["std"] }
 
 [build-dependencies]
 substrate-build-script-utils = { workspace = true }

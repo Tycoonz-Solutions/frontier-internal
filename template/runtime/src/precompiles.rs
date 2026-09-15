@@ -4,10 +4,11 @@ use pallet_evm::{
 };
 use sp_core::H160;
 
-use pallet_evm_precompile_curve25519 as curve25519_precompile;
 use pallet_evm_precompile_modexp::Modexp;
 use pallet_evm_precompile_sha3fips::Sha3FIPS256;
-use pallet_evm_precompile_simple::{ECRecover, ECRecoverPublicKey, Identity, Ripemd160, Sha256};
+use pallet_evm_precompile_simple::{
+	BlackChainMessageVerify, BlackChainVerify, Identity, Ripemd160, Sha256,
+};
 
 pub struct FrontierPrecompiles<R>(PhantomData<R>);
 
@@ -18,7 +19,7 @@ where
 	pub fn new() -> Self {
 		Self(Default::default())
 	}
-	pub fn used_addresses() -> [H160; 9] {
+	pub fn used_addresses() -> [H160; 7] {
 		[
 			hash(1),
 			hash(2),
@@ -26,9 +27,10 @@ where
 			hash(4),
 			hash(5),
 			hash(1024),
-			hash(1025),
-			hash(1026),
-			hash(1027),
+			hash(1028), // BlackChainMessageVerify (PQC personal_sign / arbitrary-message)
+			// NOTE: classical-crypto precompiles removed for a PQC-only chain:
+			//   1025 ECRecoverPublicKey (secp256k1 ECDSA),
+			//   1026/1027 Curve25519 (classical elliptic-curve ops).
 		]
 	}
 }
@@ -38,8 +40,8 @@ where
 {
 	fn execute(&self, handle: &mut impl PrecompileHandle) -> Option<PrecompileResult> {
 		match handle.code_address() {
-			// Ethereum precompiles :
-			a if a == hash(1) => Some(ECRecover::execute(handle)),
+			// BlackChain post-quantum signature verification (replaces secp256k1 ecrecover) :
+			a if a == hash(1) => Some(BlackChainVerify::execute(handle)),
 			a if a == hash(2) => Some(Sha256::execute(handle)),
 			a if a == hash(3) => Some(Ripemd160::execute(handle)),
 			a if a == hash(4) => Some(Identity::execute(handle)),
@@ -49,16 +51,11 @@ where
 				R,
 				crate::weights::pallet_evm_precompile_sha3fips::WeightInfo<R>,
 			>::execute(handle)),
-			a if a == hash(1025) => Some(ECRecoverPublicKey::execute(handle)),
-			// Curve25519 precompiles
-			a if a == hash(1026) => Some(curve25519_precompile::Curve25519Add::<
-				R,
-				crate::weights::pallet_evm_precompile_curve25519::WeightInfo<R>,
-			>::execute(handle)),
-			a if a == hash(1027) => Some(curve25519_precompile::Curve25519ScalarMul::<
-				R,
-				crate::weights::pallet_evm_precompile_curve25519::WeightInfo<R>,
-			>::execute(handle)),
+			// BlackChain PQC arbitrary-message verification (personal_sign / signMessage):
+			a if a == hash(1028) => Some(BlackChainMessageVerify::execute(handle)),
+			// Classical-crypto precompiles removed for a PQC-only chain:
+			//   1025 ECRecoverPublicKey (secp256k1 ECDSA)
+			//   1026 Curve25519Add / 1027 Curve25519ScalarMul (classical ECC)
 			_ => None,
 		}
 	}
