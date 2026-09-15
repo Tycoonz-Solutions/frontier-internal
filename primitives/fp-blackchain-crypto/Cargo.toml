@@ -1,0 +1,28 @@
+[package]
+name = "fp-blackchain-crypto"
+version = "0.1.0"
+license = "Apache-2.0"
+description = "BlackChain hybrid PQC signature primitives for Frontier — thin shim over blackchain-crypto-lib-rust."
+authors = { workspace = true }
+edition = { workspace = true }
+repository = { workspace = true }
+
+[dependencies]
+# All crypto comes from the existing BlackChain library (no re-implementation)
+blackchain-crypto-lib-rust = { git = "https://github.com/Tycoonz-Solutions/blackchain-crypto-lib-rust-fixed.git", tag = "v0.1.1" }
+
+# SHA3 / SHAKE256 for the entanglement nonce + H_combined reconstruction
+# (same version as blackchain-crypto-lib-rust uses)
+sha3 = { workspace = true }
+
+# SCALE encoding for the on-chain BlackChainTransaction type
+scale-codec = { workspace = true, features = ["derive"] }
+scale-info  = { workspace = true, features = ["derive"] }
+
+[features]
+default = ["std"]
+std = [
+	"scale-codec/std",
+	"scale-info/std",
+	"sha3/std",
+]

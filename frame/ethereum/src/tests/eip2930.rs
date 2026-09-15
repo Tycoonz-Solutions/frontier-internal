@@ -59,6 +59,7 @@ fn transaction_should_increment_nonce() {
 }
 
 #[test]
+#[ignore = "classic ECDSA is disabled on this PQC-only chain (recover_signer returns None), so this upstream test is unreachable. PQC-only rejection is asserted in tests::pqc_only; the PQC equivalent of this scenario lives in tests::blackchain"]
 fn transaction_without_enough_gas_should_not_work() {
 	let (pairs, mut ext) = new_test_ext(1);
 	let alice = &pairs[0];
@@ -86,6 +87,7 @@ fn transaction_without_enough_gas_should_not_work() {
 }
 
 #[test]
+#[ignore = "classic ECDSA is disabled on this PQC-only chain (recover_signer returns None), so this upstream test is unreachable. PQC-only rejection is asserted in tests::pqc_only; the PQC equivalent of this scenario lives in tests::blackchain"]
 fn transaction_with_to_low_nonce_should_not_work() {
 	let (pairs, mut ext) = new_test_ext(1);
 	let alice = &pairs[0];
@@ -143,6 +145,7 @@ fn transaction_with_to_low_nonce_should_not_work() {
 }
 
 #[test]
+#[ignore = "classic ECDSA is disabled on this PQC-only chain (recover_signer returns None), so this upstream test is unreachable. PQC-only rejection is asserted in tests::pqc_only; the PQC equivalent of this scenario lives in tests::blackchain"]
 fn transaction_with_to_hight_nonce_should_fail_in_block() {
 	let (pairs, mut ext) = new_test_ext(1);
 	let alice = &pairs[0];
@@ -169,6 +172,7 @@ fn transaction_with_to_hight_nonce_should_fail_in_block() {
 }
 
 #[test]
+#[ignore = "classic ECDSA is disabled on this PQC-only chain (recover_signer returns None), so this upstream test is unreachable. PQC-only rejection is asserted in tests::pqc_only; the PQC equivalent of this scenario lives in tests::blackchain"]
 fn transaction_with_invalid_chain_id_should_fail_in_block() {
 	let (pairs, mut ext) = new_test_ext(1);
 	let alice = &pairs[0];
@@ -418,6 +422,7 @@ fn event_extra_data_should_be_handle_properly() {
 }
 
 #[test]
+#[ignore = "classic ECDSA is disabled on this PQC-only chain (recover_signer returns None), so this upstream test is unreachable. PQC-only rejection is asserted in tests::pqc_only; the PQC equivalent of this scenario lives in tests::blackchain"]
 fn self_contained_transaction_with_extra_gas_should_adjust_weight_with_post_dispatch() {
 	let (pairs, mut ext) = new_test_ext(1);
 	let alice = &pairs[0];

@@ -8,8 +8,9 @@ use jsonrpsee::RpcModule;
 use sc_client_api::{
 	backend::{Backend, StorageProvider},
 	client::BlockchainEvents,
-	AuxStore, UsageProvider,
+	AuxStore, BlockBackend, UsageProvider,
 };
+use scale_codec::{Decode, Encode};
 use sc_consensus_manual_seal::rpc::EngineCommand;
 use sc_rpc::SubscriptionTaskExecutor;
 use sc_service::TransactionPool;
@@ -21,7 +22,9 @@ use sp_runtime::traits::Block as BlockT;
 // Runtime
 use frontier_template_runtime::{AccountId, Balance, Hash, Nonce};
 
+mod blackchain;
 mod eth;
+pub use self::blackchain::{Blackchain, BlackchainApiServer};
 pub use self::eth::{create_eth, EthDeps};
 
 /// Full client dependencies.
@@ -68,12 +71,14 @@ where
 	C::Api: pallet_transaction_payment_rpc::TransactionPaymentRuntimeApi<B, Balance>,
 	C::Api: fp_rpc::ConvertTransactionRuntimeApi<B>,
 	C::Api: fp_rpc::EthereumRuntimeRPCApi<B>,
+	C::Api: fp_blackchain_rpc::BlackChainApi<B>,
 	C: HeaderBackend<B> + HeaderMetadata<B, Error = BlockChainError> + 'static,
-	C: BlockchainEvents<B> + AuxStore + UsageProvider<B> + StorageProvider<B, BE>,
+	C: BlockchainEvents<B> + AuxStore + UsageProvider<B> + StorageProvider<B, BE> + BlockBackend<B>,
 	BE: Backend<B> + 'static,
 	P: TransactionPool<Block = B, Hash = B::Hash> + 'static,
 	CIDP: CreateInherentDataProviders<B, ()> + Send + 'static,
 	CT: fp_rpc::ConvertTransaction<<B as BlockT>::Extrinsic> + Send + Sync + 'static,
+	<B as BlockT>::Extrinsic: Encode + Decode,
 {
 	use pallet_transaction_payment_rpc::{TransactionPayment, TransactionPaymentApiServer};
 	use sc_consensus_manual_seal::rpc::{ManualSeal, ManualSealApiServer};
@@ -86,6 +91,12 @@ where
 		command_sink,
 		eth,
 	} = deps;
+
+	// Custom PQC RPC namespace (audit HI-8 / HI-9): submit-with-ethereum-hash and
+	// lookup of the real composite public key + signature for a mined PQC tx.
+	io.merge(
+		Blackchain::new(client.clone(), pool.clone(), eth.frontier_backend.clone()).into_rpc(),
+	)?;
 
 	io.merge(System::new(client.clone(), pool).into_rpc())?;
 	io.merge(TransactionPayment::new(client).into_rpc())?;

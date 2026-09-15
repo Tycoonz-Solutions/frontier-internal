@@ -90,9 +90,13 @@ impl FindAuthor<H160> for FindAuthorTruncated {
 parameter_types! {
 	pub const TransactionByteFee: u64 = 1;
 	pub const GasLimitStorageGrowthRatio: u64 = 0;
-	// Alice is allowed to create contracts via CREATE and CALL(CREATE)
-	pub AllowedAddressesCreate: Vec<H160> = vec![H160::from_str("0x1a642f0e3c3af545e7acbd38b07251b3990914f1").expect("alice address")];
-	pub AllowedAddressesCreateInner: Vec<H160> = vec![H160::from_str("0x1a642f0e3c3af545e7acbd38b07251b3990914f1").expect("alice address")];
+	// Alice is allowed to create contracts via CREATE and CALL(CREATE).
+	// Declared `static` so tests can extend the allow-list (e.g. to cover contract
+	// creation from a PQC-derived address, which is not known at compile time).
+	// The default is unchanged, and `static` params are thread-local, so tests that
+	// do not call `set` — including every classic-ECDSA test — are unaffected.
+	pub static AllowedAddressesCreate: Vec<H160> = vec![H160::from_str("0x1a642f0e3c3af545e7acbd38b07251b3990914f1").expect("alice address")];
+	pub static AllowedAddressesCreateInner: Vec<H160> = vec![H160::from_str("0x1a642f0e3c3af545e7acbd38b07251b3990914f1").expect("alice address")];
 }
 
 #[derive_impl(pallet_evm::config_preludes::TestDefaultConfig)]

@@ -17,7 +17,9 @@ evm = { workspace = true, features = ["with-codec"] }
 scale-codec = { workspace = true }
 scale-info = { workspace = true }
 # Substrate
+log = { workspace = true }
 frame-support = { workspace = true }
+frame-benchmarking = { workspace = true, optional = true }
 frame-system = { workspace = true }
 sp-io = { workspace = true }
 sp-runtime = { workspace = true }
@@ -29,6 +31,12 @@ fp-evm = { workspace = true }
 fp-rpc = { workspace = true }
 fp-storage = { workspace = true }
 pallet-evm = { workspace = true }
+# BlackChain PQC verification — std-only (alloy-primitives/ruint are not WASM-safe)
+fp-blackchain-crypto = { workspace = true, optional = true }
+alloy-primitives = { workspace = true, optional = true }
+# BlackChain PQC host function bridge — callable from WASM via registered host functions
+# Must be default-features=false so WASM build only gets the no_std extern stubs.
+pallet-ethereum-blackchain-hf = { workspace = true, default-features = false }
 
 [dev-dependencies]
 hex = { workspace = true }
@@ -40,6 +48,7 @@ pallet-timestamp = { workspace = true, features = ["default"] }
 sp-core = { workspace = true, features = ["default"] }
 # Frontier
 fp-self-contained = { workspace = true, features = ["default"] }
+blackchain-crypto-lib-rust = { git = "https://github.com/Tycoonz-Solutions/blackchain-crypto-lib-rust-fixed.git", tag = "v0.1.1" }
 
 [features]
 default = ["std"]
@@ -51,7 +60,9 @@ std = [
 	"scale-codec/std",
 	"scale-info/std",
 	# Substrate
+	"log/std",
 	"frame-support/std",
+	"frame-benchmarking?/std",
 	"frame-system/std",
 	"sp-io/std",
 	"sp-runtime/std",
@@ -63,8 +74,13 @@ std = [
 	"fp-rpc/std",
 	"fp-storage/std",
 	"pallet-evm/std",
+	"fp-blackchain-crypto/std",
+	"fp-blackchain-crypto",
+	"alloy-primitives",
+	"pallet-ethereum-blackchain-hf/std",
 ]
 runtime-benchmarks = [
+	"frame-benchmarking/runtime-benchmarks",
 	"frame-support/runtime-benchmarks",
 	"frame-system/runtime-benchmarks",
 	"pallet-evm/runtime-benchmarks",

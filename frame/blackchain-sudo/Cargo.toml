@@ -1,0 +1,56 @@
+[package]
+name = "pallet-blackchain-sudo"
+version = "0.1.0"
+license = "Apache-2.0"
+description = "PQC-authenticated sudo/admin pallet — dispatches Root calls authorised by a BlackChain hybrid (Dilithium5+P-521+Ed448) signature, restoring an upgrade/governance path on a PQC-only chain."
+authors = { workspace = true }
+edition = { workspace = true }
+repository = { workspace = true }
+
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
+
+[dependencies]
+scale-codec = { workspace = true }
+scale-info = { workspace = true }
+log = { workspace = true }
+# Substrate
+frame-support = { workspace = true }
+frame-system = { workspace = true }
+sp-core = { workspace = true }
+sp-io = { workspace = true }
+sp-runtime = { workspace = true }
+# BlackChain PQC verification — std-only native path (alloy/ruint are not WASM-safe)
+fp-blackchain-crypto = { workspace = true, optional = true }
+# BlackChain PQC host-function bridge — WASM path (no_std extern stub, native full crypto)
+pallet-ethereum-blackchain-hf = { workspace = true, default-features = false }
+
+[dev-dependencies]
+sp-core = { workspace = true, features = ["default"] }
+blackchain-crypto-lib-rust = { git = "https://github.com/Tycoonz-Solutions/blackchain-crypto-lib-rust-fixed.git", tag = "v0.1.1" }
+
+[features]
+default = ["std"]
+std = [
+	"scale-codec/std",
+	"scale-info/std",
+	"log/std",
+	"frame-support/std",
+	"frame-system/std",
+	"sp-core/std",
+	"sp-io/std",
+	"sp-runtime/std",
+	"fp-blackchain-crypto",
+	"fp-blackchain-crypto/std",
+	"pallet-ethereum-blackchain-hf/std",
+]
+runtime-benchmarks = [
+	"frame-support/runtime-benchmarks",
+	"frame-system/runtime-benchmarks",
+	"sp-runtime/runtime-benchmarks",
+]
+try-runtime = [
+	"frame-support/try-runtime",
+	"frame-system/try-runtime",
+	"sp-runtime/try-runtime",
+]

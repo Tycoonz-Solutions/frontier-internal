@@ -305,6 +305,7 @@ fn eip7702_happy_path() {
 }
 
 #[test]
+#[ignore = "classic ECDSA is disabled on this PQC-only chain (recover_signer returns None), so this upstream test is unreachable. PQC-only rejection is asserted in tests::pqc_only; the PQC equivalent of this scenario lives in tests::blackchain"]
 fn valid_eip7702_transaction_structure() {
 	let (pairs, mut ext) = new_test_ext_with_initial_balance(2, 10_000_000_000_000);
 	let alice = &pairs[0];
@@ -337,6 +338,7 @@ fn valid_eip7702_transaction_structure() {
 }
 
 #[test]
+#[ignore = "classic ECDSA is disabled on this PQC-only chain (recover_signer returns None), so this upstream test is unreachable. PQC-only rejection is asserted in tests::pqc_only; the PQC equivalent of this scenario lives in tests::blackchain"]
 fn eip7702_transaction_with_empty_authorization_list_fails() {
 	let (pairs, mut ext) = new_test_ext_with_initial_balance(2, 10_000_000_000_000);
 	let alice = &pairs[0];
@@ -498,6 +500,7 @@ fn eip7702_transaction_execution() {
 }
 
 #[test]
+#[ignore = "classic ECDSA is disabled on this PQC-only chain (recover_signer returns None), so this upstream test is unreachable. PQC-only rejection is asserted in tests::pqc_only; the PQC equivalent of this scenario lives in tests::blackchain"]
 fn authorization_with_wrong_chain_id() {
 	let (pairs, mut ext) = new_test_ext_with_initial_balance(2, 10_000_000_000_000);
 	let alice = &pairs[0];
@@ -534,6 +537,7 @@ fn authorization_with_wrong_chain_id() {
 }
 
 #[test]
+#[ignore = "classic ECDSA is disabled on this PQC-only chain (recover_signer returns None), so this upstream test is unreachable. PQC-only rejection is asserted in tests::pqc_only; the PQC equivalent of this scenario lives in tests::blackchain"]
 fn authorization_with_zero_chain_id() {
 	let (pairs, mut ext) = new_test_ext_with_initial_balance(2, 10_000_000_000_000);
 	let alice = &pairs[0];
@@ -566,6 +570,7 @@ fn authorization_with_zero_chain_id() {
 }
 
 #[test]
+#[ignore = "classic ECDSA is disabled on this PQC-only chain (recover_signer returns None), so this upstream test is unreachable. PQC-only rejection is asserted in tests::pqc_only; the PQC equivalent of this scenario lives in tests::blackchain"]
 fn multiple_authorizations_for_same_authority() {
 	let (pairs, mut ext) = new_test_ext_with_initial_balance(2, 10_000_000_000_000);
 	let alice = &pairs[0];
@@ -601,6 +606,7 @@ fn multiple_authorizations_for_same_authority() {
 }
 
 #[test]
+#[ignore = "classic ECDSA is disabled on this PQC-only chain (recover_signer returns None), so this upstream test is unreachable. PQC-only rejection is asserted in tests::pqc_only; the PQC equivalent of this scenario lives in tests::blackchain"]
 fn gas_cost_calculation_with_authorizations() {
 	let (pairs, mut ext) = new_test_ext_with_initial_balance(2, 10_000_000_000_000);
 	let alice = &pairs[0];

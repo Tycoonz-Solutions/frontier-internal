@@ -24,6 +24,15 @@ polkadot.*
 
 # Added by cargo
 /target
+/target-pqc
+
+
+# For Internal Testing and Stuff
+/tools/
+/vendor/
+/internal_docs/
+/contracts/
+/scripts/
 
 # Vitepress
 /docs/.vitepress/cache
@@ -31,3 +40,6 @@ polkadot.*
 
 # NixOS development environment
 .envrc
+
+# Local testnet keys — NEVER commit
+/.testnet-secrets/

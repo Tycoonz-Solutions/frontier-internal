@@ -183,7 +183,7 @@ pub const VERSION: RuntimeVersion = RuntimeVersion {
 	spec_name: Cow::Borrowed("frontier-template"),
 	impl_name: Cow::Borrowed("frontier-template"),
 	authoring_version: 1,
-	spec_version: 1,
+	spec_version: 2,
 	impl_version: 1,
 	apis: RUNTIME_API_VERSIONS,
 	transaction_version: 1,
@@ -332,6 +332,13 @@ impl pallet_sudo::Config for Runtime {
 
 impl pallet_evm_chain_id::Config for Runtime {}
 
+impl pallet_blackchain_sudo::Config for Runtime {
+	type RuntimeCall = RuntimeCall;
+	// Bind admin signatures to this chain's id (same value as the EVM chain id),
+	// preventing cross-chain replay of privileged calls.
+	type ChainId = <Self as pallet_evm::Config>::ChainId;
+}
+
 pub struct FindAuthorTruncated<F>(PhantomData<F>);
 impl<F: FindAuthor<u32>> FindAuthor<H160> for FindAuthorTruncated<F> {
 	fn find_author<'a, I>(digests: I) -> Option<H160>
@@ -351,6 +358,38 @@ const BLOCK_GAS_LIMIT: u64 = 75_000_000;
 const MAX_POV_SIZE: u64 = 5 * 1024 * 1024;
 /// The maximum storage growth per block in bytes.
 const MAX_STORAGE_GROWTH: u64 = 400 * 1024;
+
+// ---------------------------------------------------------------------------
+// BlackChain PQC block capacity analysis
+// ---------------------------------------------------------------------------
+//
+// Each BlackChain PQC transaction carries significant fixed payload overhead:
+//   pqc_signature  : ~4,841 bytes  (Dilithium5 ‖ P-521 ‖ Ed448)
+//   pub_key        : ~2,782 bytes  (Dilithium5 ‖ P-521 ‖ Ed448 public keys)
+//   ---
+//   fixed overhead : ~7,623 bytes per transaction (before ABI/SCALE framing)
+//
+// PoV-limit throughput (with 5 MB PoV, ~7.6 KB/tx overhead):
+//   MAX_POV_SIZE / 7_623 ≈ 655 PQC txs/block (upper bound, ignoring headers)
+//
+// Gas-limit throughput (with 75M gas limit, 21,000 gas/simple transfer):
+//   BLOCK_GAS_LIMIT / 21_000 ≈ 3,571 txs (this is NOT the binding constraint)
+//
+// The binding constraint for PQC txs is the PoV size, not gas.
+// With the default settings this chain can process roughly 600–650 simple PQC
+// value-transfer transactions per block.
+//
+// TODO before mainnet:
+//   1. Measure actual PQC tx serialised size on a loaded block.
+//   2. Run throughput tests to determine real block capacity.
+//   3. Consider increasing MAX_POV_SIZE or implementing batching if needed.
+//   4. Model propagation latency for blocks full of 7.6 KB transactions.
+const PQC_SIG_BYTES: u64 = 4_841;
+const PQC_PK_BYTES: u64 = 2_782;
+/// Approximate fixed payload overhead per PQC transaction in bytes.
+pub const PQC_TX_PAYLOAD_BYTES: u64 = PQC_SIG_BYTES + PQC_PK_BYTES;
+/// Approximate maximum PQC transactions per block (PoV-limited, not gas-limited).
+pub const PQC_MAX_TXS_PER_BLOCK_POV: u64 = MAX_POV_SIZE / PQC_TX_PAYLOAD_BYTES;
 
 parameter_types! {
 	pub BlockGasLimit: U256 = U256::from(BLOCK_GAS_LIMIT);
@@ -394,6 +433,11 @@ impl pallet_ethereum::Config for Runtime {
 	type StateRoot = pallet_ethereum::IntermediateStateRoot<Self::Version>;
 	type PostLogContent = PostBlockAndTxnHashes;
 	type ExtraDataLength = ConstU32<30>;
+	/// Use benchmarked weights for PQC signature verification.
+	///
+	/// `SubstrateWeight<Runtime>` reads its values from `frame/ethereum/src/weights.rs`.
+	/// Run the benchmark command in that file's doc-comment to populate it with real numbers.
+	type BlackChainWeightInfo = pallet_ethereum::weights::SubstrateWeight<Runtime>;
 }
 
 parameter_types! {
@@ -507,6 +551,12 @@ mod runtime {
 
 	#[runtime::pallet_index(11)]
 	pub type ManualSeal = pallet_manual_seal;
+
+	// PQC-authenticated admin path: dispatches Root calls (set_code, governance,
+	// key rotation) authorised by a composite Dilithium5+P-521+Ed448 signature,
+	// since classic signed extrinsics — and therefore pallet-sudo — are disabled.
+	#[runtime::pallet_index(12)]
+	pub type BlackchainSudo = pallet_blackchain_sudo;
 }
 
 #[derive(Clone)]
@@ -538,6 +588,7 @@ impl fp_self_contained::SelfContainedCall for RuntimeCall {
 	fn is_self_contained(&self) -> bool {
 		match self {
 			RuntimeCall::Ethereum(call) => call.is_self_contained(),
+			RuntimeCall::BlackchainSudo(call) => call.is_self_contained(),
 			_ => false,
 		}
 	}
@@ -545,6 +596,7 @@ impl fp_self_contained::SelfContainedCall for RuntimeCall {
 	fn check_self_contained(&self) -> Option<Result<Self::SignedInfo, TransactionValidityError>> {
 		match self {
 			RuntimeCall::Ethereum(call) => call.check_self_contained(),
+			RuntimeCall::BlackchainSudo(call) => call.check_self_contained(),
 			_ => None,
 		}
 	}
@@ -557,6 +609,9 @@ impl fp_self_contained::SelfContainedCall for RuntimeCall {
 	) -> Option<TransactionValidity> {
 		match self {
 			RuntimeCall::Ethereum(call) => call.validate_self_contained(info, dispatch_info, len),
+			RuntimeCall::BlackchainSudo(call) => {
+				call.validate_self_contained(info, dispatch_info, len)
+			}
 			_ => None,
 		}
 	}
@@ -571,6 +626,9 @@ impl fp_self_contained::SelfContainedCall for RuntimeCall {
 			RuntimeCall::Ethereum(call) => {
 				call.pre_dispatch_self_contained(info, dispatch_info, len)
 			}
+			RuntimeCall::BlackchainSudo(call) => {
+				call.pre_dispatch_self_contained(info, dispatch_info, len)
+			}
 			_ => None,
 		}
 	}
@@ -583,6 +641,19 @@ impl fp_self_contained::SelfContainedCall for RuntimeCall {
 			call @ RuntimeCall::Ethereum(pallet_ethereum::Call::transact { .. }) => {
 				Some(call.dispatch(RuntimeOrigin::from(
 					pallet_ethereum::RawOrigin::EthereumTransaction(info),
+				)))
+			}
+			call @ RuntimeCall::Ethereum(pallet_ethereum::Call::transact_blackchain { .. }) => {
+				Some(call.dispatch(RuntimeOrigin::from(
+					pallet_ethereum::RawOrigin::EthereumTransaction(info),
+				)))
+			}
+			// PQC-authenticated admin call: dispatch with the verified admin origin,
+			// which the pallet's `sudo` then elevates to `Root` after checking the
+			// configured admin key and nonce.
+			call @ RuntimeCall::BlackchainSudo(pallet_blackchain_sudo::Call::sudo { .. }) => {
+				Some(call.dispatch(RuntimeOrigin::from(
+					pallet_blackchain_sudo::RawOrigin::BlackchainAdmin(info),
 				)))
 			}
 			_ => None,
@@ -601,6 +672,7 @@ mod benches {
 		[pallet_evm, EVM]
 		[pallet_evm_precompile_curve25519, EVMPrecompileCurve25519Bench::<Runtime>]
 		[pallet_evm_precompile_sha3fips, EVMPrecompileSha3FIPSBench::<Runtime>]
+		[pallet_ethereum, Ethereum]
 	);
 }
 
@@ -993,6 +1065,14 @@ impl_runtime_apis! {
 		) -> Vec<EthereumTransaction> {
 			xts.into_iter().filter_map(|xt| match xt.0.function {
 				RuntimeCall::Ethereum(transact { transaction }) => Some(transaction),
+				// Include BlackChain PQC transactions so pending-state RPCs
+				// (eth_pendingTransactions, txpool_content, and the pre-mining
+				// eth_getTransactionByHash fallback) surface them instead of dropping
+				// them. Convert to the same derived EIP-1559 form used at execution
+				// (`blackchain_to_evm_transaction`), so the hash seen while pending is
+				// identical to the hash once the transaction is mined.
+				RuntimeCall::Ethereum(pallet_ethereum::Call::transact_blackchain { transaction }) =>
+					pallet_ethereum::Pallet::<Runtime>::blackchain_to_evm_transaction(&transaction),
 				_ => None
 			}).collect::<Vec<EthereumTransaction>>()
 		}
@@ -1028,6 +1108,36 @@ impl_runtime_apis! {
 			UncheckedExtrinsic::new_bare(
 				pallet_ethereum::Call::<Runtime>::transact { transaction }.into(),
 			)
+		}
+	}
+
+	impl fp_blackchain_rpc::BlackChainApi<Block> for Runtime {
+		fn blackchain_tx_info(
+			extrinsic: Vec<u8>,
+		) -> Option<(H256, H160, Vec<u8>, Vec<u8>)> {
+			// Decode a single bare extrinsic and, if it is a `transact_blackchain`
+			// call, return (ethereum_hash, sender, composite_pub_key, composite_sig).
+			// The ethereum hash is the SAME derived hash the tx is indexed under, so
+			// callers can query it via eth_getTransactionByHash (HI-9); the sender and
+			// composite key/signature let explorers recover/verify the real signer
+			// without trusting the placeholder r/s/v (HI-8).
+			let uxt = UncheckedExtrinsic::decode(&mut &extrinsic[..]).ok()?;
+			match uxt.0.function {
+				RuntimeCall::Ethereum(pallet_ethereum::Call::transact_blackchain {
+					transaction,
+				}) => {
+					let eth_tx =
+						pallet_ethereum::Pallet::<Runtime>::blackchain_to_evm_transaction(
+							&transaction,
+						)?;
+					let eth_hash = eth_tx.hash();
+					let sender = H160::from_slice(
+						&sp_core::keccak_256(&transaction.pub_key)[12..],
+					);
+					Some((eth_hash, sender, transaction.pub_key, transaction.pqc_signature))
+				}
+				_ => None,
+			}
 		}
 	}
 

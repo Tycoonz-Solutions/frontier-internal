@@ -46,6 +46,9 @@ impl SubstrateCli for Cli {
 				Box::new(chain_spec::development_config(enable_manual_seal))
 			}
 			"" | "local" => Box::new(chain_spec::local_testnet_config()),
+			// Public testnet scaffold (ChainType::Live). Panics until the placeholder
+			// admin key in chain_spec.rs is replaced with a team-controlled address.
+			"testnet" => Box::new(chain_spec::public_testnet_config()),
 			path => Box::new(chain_spec::ChainSpec::from_json_file(
 				std::path::PathBuf::from(path),
 			)?),
@@ -166,7 +169,7 @@ pub fn run() -> sc_cli::Result<()> {
 			let runner = cli.create_runner(cmd)?;
 			match cmd {
 				BenchmarkCmd::Pallet(cmd) => runner
-					.sync_run(|config| cmd.run_with_spec::<Hashing, ()>(Some(config.chain_spec))),
+					.sync_run(|config| cmd.run_with_spec::<Hashing, service::HostFunctions>(Some(config.chain_spec))),
 				BenchmarkCmd::Block(cmd) => runner.sync_run(|mut config| {
 					let (client, _, _, _, _) = service::new_chain_ops(&mut config, &cli.eth)?;
 					cmd.run(client)

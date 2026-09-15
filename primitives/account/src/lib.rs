@@ -198,23 +198,22 @@ pub struct EthereumSignature(ecdsa::Signature);
 
 impl sp_runtime::traits::Verify for EthereumSignature {
 	type Signer = EthereumSigner;
-	fn verify<L: sp_runtime::traits::Lazy<[u8]>>(&self, mut msg: L, signer: &AccountId20) -> bool {
-		let m = keccak_256(msg.get());
-		match sp_io::crypto::secp256k1_ecdsa_recover(self.0.as_ref(), &m) {
-			Ok(pubkey) => AccountId20(H160::from(H256::from(keccak_256(&pubkey))).0) == *signer,
-			Err(sp_io::EcdsaVerifyError::BadRS) => {
-				log::error!(target: "evm", "Error recovering: Incorrect value of R or S");
-				false
-			}
-			Err(sp_io::EcdsaVerifyError::BadV) => {
-				log::error!(target: "evm", "Error recovering: Incorrect value of V");
-				false
-			}
-			Err(sp_io::EcdsaVerifyError::BadSignature) => {
-				log::error!(target: "evm", "Error recovering: Invalid signature");
-				false
-			}
-		}
+	fn verify<L: sp_runtime::traits::Lazy<[u8]>>(&self, _msg: L, _signer: &AccountId20) -> bool {
+		// ── BlackChain is a PQC-only chain ──────────────────────────────────
+		// Classical secp256k1 ECDSA is broken by a sufficiently large quantum
+		// computer (Shor's algorithm), so it must NOT be a valid authentication
+		// mechanism anywhere on the network.
+		//
+		// This `Verify` impl is what authenticates *signed Substrate extrinsics*
+		// (the `(address, signature, extra)` format used to call pallets such as
+		// Balances or Sudo directly). Returning `false` unconditionally makes
+		// every such extrinsic fail signature checking with `BadProof`, so the
+		// only ways to authorise state changes are:
+
+		// NOTE: this deliberately disables the classical signed-extrinsic path.
+		// Any admin capability that used to rely on a signed extrinsic (e.g.
+		// `pallet_sudo`) must instead be driven through the PQC path.
+		false
 	}
 }
 
@@ -315,5 +314,33 @@ mod tests {
 		let account: AccountId20 = signer.into_account();
 		let account_fmt = format!("{account}");
 		assert_eq!(account_fmt, "0xE04CC55ebEE1cBCE552f250e85c57B70B2E2625b");
+	}
+
+	// PQC-only guarantee: a cryptographically VALID secp256k1 signature — one that
+	// would authenticate under classical Ethereum ECDSA recovery — must be rejected
+	// by `EthereumSignature::verify`, so no signed Substrate extrinsic can ever be
+	// authenticated with classical crypto. If someone re-enables ECDSA verification,
+	// this test fails.
+	#[test]
+	fn valid_secp256k1_signature_is_rejected_on_pqc_chain() {
+		use sp_core::Pair as _;
+		use sp_runtime::traits::Verify;
+
+		// Deterministic secp256k1 key and its Ethereum-style AccountId20.
+		let pair = ecdsa::Pair::from_seed_slice(&[7u8; 32]).unwrap();
+		let signer: EthereumSigner = pair.public().into();
+		let account: AccountId20 = signer.into_account();
+
+		// Sign keccak_256(msg) — the exact hash the (former) verify path recovered
+		// against — so this signature genuinely authenticates `account` under
+		// classical Ethereum ECDSA.
+		let msg = b"pqc-only: classical signatures must not authenticate";
+		let m = keccak_256(msg);
+		let eth_sig = EthereumSignature::new(pair.sign_prehashed(&m));
+
+		assert!(
+			!eth_sig.verify(&msg[..], &account),
+			"a valid classical ECDSA signature must be rejected on a PQC-only chain",
+		);
 	}
 }

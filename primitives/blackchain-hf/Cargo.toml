@@ -1,0 +1,39 @@
+[package]
+name = "pallet-ethereum-blackchain-hf"
+version = "0.1.0"
+license = "Apache-2.0"
+description = "Substrate host functions for BlackChain PQC signature verification."
+edition = "2021"
+
+# This crate compiles twice:
+#   1. Native (std) — for the host-function body (full crypto).
+#   2. WASM (no_std) — for the extern-stub used by the WASM runtime.
+# Deps that are std-only must be feature-gated.
+
+[dependencies]
+sp-runtime-interface = { workspace = true }
+scale-codec           = { workspace = true }
+
+# std-only: the native host function body
+fp-blackchain-crypto = { workspace = true, optional = true }
+alloy-primitives     = { workspace = true, optional = true }
+log                  = { workspace = true, optional = true }
+
+[features]
+default = ["std"]
+std = [
+    "sp-runtime-interface/std",
+    "scale-codec/std",
+    "fp-blackchain-crypto",
+    "fp-blackchain-crypto/std",
+    "alloy-primitives",
+    "alloy-primitives/std",
+    "log",
+    "log/std",
+]
+
+# The `#[runtime_interface]` macro (sp-runtime-interface) emits `#[cfg(substrate_runtime)]`
+# in its generated code. Declare it as a known cfg so the `unexpected_cfgs` lint (and
+# `-D warnings`) does not flag it. This is the same allowlisting polkadot-sdk itself uses.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(substrate_runtime)'] }

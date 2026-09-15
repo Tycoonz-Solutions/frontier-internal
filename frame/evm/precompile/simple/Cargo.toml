@@ -8,6 +8,10 @@ repository = { workspace = true }
 
 [dependencies]
 ripemd = { version = "0.1", default-features = false }
+# BlackChain PQC verification host-function bridge — callable from both native and
+# WASM. The actual composite crypto runs natively inside the host function; this
+# crate must be default-features=false so the WASM build only links the extern stub.
+pallet-ethereum-blackchain-hf = { workspace = true, default-features = false }
 # Substrate
 sp-io = { workspace = true }
 # Frontier
@@ -16,11 +20,17 @@ fp-evm = { workspace = true }
 [dev-dependencies]
 # Frontier
 pallet-evm-test-vector-support = { workspace = true }
+# BlackChain PQC — used to build REAL composite signatures for the
+# `BlackChainVerify` precompile tests (native/std only).
+blackchain-crypto-lib-rust = { git = "https://github.com/Tycoonz-Solutions/blackchain-crypto-lib-rust-fixed.git", tag = "v0.1.1" }
+alloy-primitives = { workspace = true, features = ["default"] }
 
 [features]
 default = ["std"]
 std = [
 	"ripemd/std",
+	# BlackChain
+	"pallet-ethereum-blackchain-hf/std",
 	# Substrate
 	"sp-io/std",
 	# Frontier
