@@ -101,6 +101,10 @@ pub struct Header {
 	pub difficulty: U256,
 	/// Nonce
 	pub nonce: Option<H64>,
+	/// Mix hash. Post-merge this carries the block's prevrandao; serialized as
+	/// `mixHash`. Required by post-merge EVM tooling (forge fork / viem / ethers /
+	/// Blockscout) which reads PREVRANDAO from this field.
+	pub mix_hash: H256,
 	/// Size in bytes
 	pub size: Option<U256>,
 }
