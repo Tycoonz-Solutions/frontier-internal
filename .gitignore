@@ -25,6 +25,7 @@ polkadot.*
 # Added by cargo
 /target
 /target-pqc
+/vec
 
 
 # For Internal Testing and Stuff

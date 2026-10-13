@@ -575,6 +575,7 @@ fn rich_block_build(
 				timestamp: U256::from(block.header.timestamp / 1000),
 				difficulty: block.header.difficulty,
 				nonce,
+				mix_hash: block.header.mix_hash,
 				size: Some(U256::from(rlp::encode(&block.header).len() as u32)),
 			},
 			total_difficulty,
