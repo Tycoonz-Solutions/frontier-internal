@@ -34,6 +34,7 @@ polkadot.*
 /internal_docs/
 /contracts/
 /scripts/
+/deploy
 
 # Vitepress
 /docs/.vitepress/cache

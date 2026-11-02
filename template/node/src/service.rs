@@ -224,6 +224,9 @@ where
 {
 	let frontier_block_import =
 		FrontierBlockImport::new(grandpa_block_import.clone(), client.clone());
+	// Warm the PQC verify cache in parallel before each block is executed.
+	let block_import =
+		crate::pqc_prewarm::PqcPrewarmBlockImport::new(frontier_block_import, client.clone());
 
 	let slot_duration = sc_consensus_aura::slot_duration(&*client)?;
 	let target_gas_price = eth_config.target_gas_price;
@@ -240,7 +243,7 @@ where
 
 	let import_queue = sc_consensus_aura::import_queue::<AuraPair, _, _, _, _, _>(
 		sc_consensus_aura::ImportQueueParams {
-			block_import: frontier_block_import.clone(),
+			block_import: block_import.clone(),
 			justification_import: Some(Box::new(grandpa_block_import)),
 			client,
 			create_inherent_data_providers,
@@ -253,7 +256,7 @@ where
 	)
 	.map_err::<ServiceError, _>(Into::into)?;
 
-	Ok((import_queue, Box::new(frontier_block_import)))
+	Ok((import_queue, Box::new(block_import)))
 }
 
 /// Build the import queue for the template runtime (manual seal).
@@ -272,14 +275,16 @@ where
 	RA::RuntimeApi: RuntimeApiCollection<B, AuraId, AccountId, Nonce, Balance>,
 	HF: HostFunctionsT + 'static,
 {
-	let frontier_block_import = FrontierBlockImport::new(client.clone(), client);
+	let frontier_block_import = FrontierBlockImport::new(client.clone(), client.clone());
+	// Warm the PQC verify cache in parallel before each block is executed.
+	let block_import = crate::pqc_prewarm::PqcPrewarmBlockImport::new(frontier_block_import, client);
 	Ok((
 		sc_consensus_manual_seal::import_queue(
-			Box::new(frontier_block_import.clone()),
+			Box::new(block_import.clone()),
 			&task_manager.spawn_essential_handle(),
 			config.prometheus_registry(),
 		),
-		Box::new(frontier_block_import),
+		Box::new(block_import),
 	))
 }
 
@@ -549,13 +554,18 @@ where
 			return Ok(task_manager);
 		}
 
-		let proposer_factory = sc_basic_authorship::ProposerFactory::new(
+		let mut proposer_factory = sc_basic_authorship::ProposerFactory::new(
 			task_manager.spawn_handle(),
 			client.clone(),
 			transaction_pool.clone(),
 			prometheus_registry.as_ref(),
 			telemetry.as_ref().map(|x| x.handle()),
 		);
+		// The proposer defaults to a 4 MiB body cap (sc-basic-authorship
+		// DEFAULT_BLOCK_SIZE_LIMIT), which with ~7.7 KB PQC extrinsics stops a block
+		// at ~540 txs long before the runtime's 48 MiB normal-class BlockLength. Lift
+		// it to the runtime maximum so BlockLength/BlockWeights are the real bound.
+		proposer_factory.set_default_block_size_limit(64 * 1024 * 1024);
 
 		let slot_duration = sc_consensus_aura::slot_duration(&*client)?;
 		let target_gas_price = eth_config.target_gas_price;
@@ -667,13 +677,16 @@ where
 	RA::RuntimeApi: RuntimeApiCollection<B, AuraId, AccountId, Nonce, Balance>,
 	HF: HostFunctionsT + 'static,
 {
-	let proposer_factory = sc_basic_authorship::ProposerFactory::new(
+	let mut proposer_factory = sc_basic_authorship::ProposerFactory::new(
 		task_manager.spawn_handle(),
 		client.clone(),
 		transaction_pool.clone(),
 		prometheus_registry,
 		telemetry.as_ref().map(|x| x.handle()),
 	);
+	// Lift the proposer's default 4 MiB body cap (see the aura path above) so the
+	// runtime's 48 MiB normal BlockLength is the real ceiling for PQC-sized txs.
+	proposer_factory.set_default_block_size_limit(64 * 1024 * 1024);
 
 	thread_local!(static TIMESTAMP: RefCell<u64> = const { RefCell::new(0) });
 

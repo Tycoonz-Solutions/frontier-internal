@@ -21,7 +21,13 @@
 extern crate alloc;
 
 use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 use core::fmt;
+
+// The host-function bridge is referenced only from the no_std (WASM) verification
+// path; mark it used under std so `unused_crate_dependencies` stays quiet there.
+#[cfg(feature = "std")]
+use pallet_ethereum_blackchain_hf as _;
 
 use scale_codec::{Decode, DecodeWithMemTracking, Encode, MaxEncodedLen};
 use scale_info::TypeInfo;
@@ -274,6 +280,127 @@ impl From<ecdsa::Public> for EthereumSigner {
 	}
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Post-quantum signed-extrinsic authentication
+//
+// `PqcSignature` is the runtime's `Signature` type on a BlackChain network. Making
+// it the runtime signature puts EVERY signed Substrate extrinsic — any pallet call
+// (Balances, System, future pallets) — behind the composite hybrid verifier at the
+// single `Verify` choke point, with no per-pallet code. Unlike ECDSA, a PQC
+// signature carries its own public key (verification cannot recover it), and the
+// account is `keccak256(pub_key)[12..]` — byte-for-byte the EVM H160, so one key is
+// one account across the Substrate and EVM sides.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Composite public key size: ML-DSA-87-pk(2592) + P521-pk(133) + Ed448-pk(57).
+pub const COMPOSITE_PK_SIZE: usize = 2782;
+/// Composite signature size: ML-DSA-87-sig(4627) + P521-sig(132) + Ed448-sig(114).
+pub const COMPOSITE_SIG_SIZE: usize = 4873;
+
+/// Domain-separation tag folded into every signed-extrinsic payload, keeping this
+/// path's signatures disjoint from the EVM / admin / message paths. Bumping the
+/// version invalidates all previously-produced extrinsic signatures.
+pub const EXTRINSIC_DOMAIN_TAG: &[u8] = b"BLACKCHAIN_EXTRINSIC_V1";
+
+/// A composite post-quantum signature over a signed Substrate extrinsic:
+/// `[ML-DSA-87 ‖ P-521 ‖ Ed448]` plus the composite public key it was made with.
+#[derive(Clone, Eq, PartialEq)]
+#[derive(RuntimeDebug, Encode, Decode, DecodeWithMemTracking, TypeInfo)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct PqcSignature {
+	/// Composite public key (`COMPOSITE_PK_SIZE` bytes).
+	pub pub_key: Vec<u8>,
+	/// Composite signature (`COMPOSITE_SIG_SIZE` bytes).
+	pub signature: Vec<u8>,
+}
+
+impl PqcSignature {
+	pub fn new(pub_key: Vec<u8>, signature: Vec<u8>) -> Self {
+		Self { pub_key, signature }
+	}
+
+	/// Verify the composite signature over `message` and recover the signer, via
+	/// the native crypto (std) or the `verify_pqc_message` host function (WASM).
+	fn recover(message: &[u8], signature: &[u8], pub_key: &[u8]) -> Option<AccountId20> {
+		#[cfg(feature = "std")]
+		{
+			fp_blackchain_crypto::verify_message(message, signature, pub_key)
+				.ok()
+				.map(AccountId20)
+		}
+		#[cfg(not(feature = "std"))]
+		{
+			use pallet_ethereum_blackchain_hf::blackchain_crypto;
+			let out = blackchain_crypto::verify_pqc_message(
+				message.to_vec(),
+				signature.to_vec(),
+				pub_key.to_vec(),
+			);
+			if out.len() == 20 {
+				let mut a = [0u8; 20];
+				a.copy_from_slice(&out);
+				Some(AccountId20(a))
+			} else {
+				None
+			}
+		}
+	}
+}
+
+impl sp_runtime::traits::Verify for PqcSignature {
+	type Signer = PqcSigner;
+
+	fn verify<L: sp_runtime::traits::Lazy<[u8]>>(
+		&self,
+		mut msg: L,
+		signer: &AccountId20,
+	) -> bool {
+		// Cheap structural pre-check before the ~1.6 ms verify.
+		if self.pub_key.len() != COMPOSITE_PK_SIZE || self.signature.len() != COMPOSITE_SIG_SIZE {
+			return false;
+		}
+		// Domain-separate the signed payload so an extrinsic signature can never be
+		// valid on another path.
+		let payload = msg.get();
+		let mut message = Vec::with_capacity(EXTRINSIC_DOMAIN_TAG.len() + payload.len());
+		message.extend_from_slice(EXTRINSIC_DOMAIN_TAG);
+		message.extend_from_slice(payload);
+
+		match Self::recover(&message, &self.signature, &self.pub_key) {
+			Some(recovered) => &recovered == signer,
+			None => false,
+		}
+	}
+}
+
+/// Signer side of [`PqcSignature`]: carries the recovered 20-byte address and
+/// resolves it to the runtime `AccountId` (`AccountId20`). The runtime derives its
+/// `AccountId` from this, so switching the signature type keeps the address rule
+/// (`keccak256(pub_key)[12..]`) consistent everywhere with no hard-coding.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(RuntimeDebug, Encode, Decode, MaxEncodedLen, TypeInfo)]
+#[repr(transparent)]
+pub struct PqcSigner([u8; 20]);
+
+impl From<[u8; 20]> for PqcSigner {
+	fn from(x: [u8; 20]) -> Self {
+		PqcSigner(x)
+	}
+}
+
+impl sp_runtime::traits::IdentifyAccount for PqcSigner {
+	type AccountId = AccountId20;
+	fn into_account(self) -> AccountId20 {
+		AccountId20(self.0)
+	}
+}
+
+impl fmt::Display for PqcSigner {
+	fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+		write!(fmt, "{:?}", H160::from(self.0))
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -342,5 +469,79 @@ mod tests {
 			!eth_sig.verify(&msg[..], &account),
 			"a valid classical ECDSA signature must be rejected on a PQC-only chain",
 		);
+	}
+
+	// ── PQC signed-extrinsic path ──────────────────────────────────────────
+	use blackchain_crypto_lib_rust::{sign_message, BlackChainPrivateKey};
+	use sp_runtime::traits::Verify;
+
+	fn pqc_key(seed_byte: u8) -> BlackChainPrivateKey {
+		let (k, _) = BlackChainPrivateKey::generate(&[seed_byte; 64]).expect("keygen");
+		k
+	}
+
+	fn pqc_address(k: &BlackChainPrivateKey) -> AccountId20 {
+		let pk = k.public_key().to_bytes();
+		AccountId20(
+			keccak_256(&pk)[12..]
+				.try_into()
+				.expect("20-byte slice; qed"),
+		)
+	}
+
+	/// The runtime's address rule (`keccak256(pub_key)[12..]` via `PqcSigner`)
+	/// matches the crypto library's own `derive_address`.
+	#[test]
+	fn pqc_signer_matches_library_address_derivation() {
+		let k = pqc_key(1);
+		let lib_addr = k.public_key().derive_address();
+		let signer = PqcSigner(
+			keccak_256(&k.public_key().to_bytes())[12..]
+				.try_into()
+				.unwrap(),
+		);
+		assert_eq!(signer.into_account().0, lib_addr.into_array());
+	}
+
+	/// A correctly domain-tagged, PQC-signed payload authenticates the signer; a
+	/// wrong signer, tampered signature, or missing domain tag all fail.
+	#[test]
+	fn pqc_signature_verifies_signed_extrinsic_payload() {
+		let k = pqc_key(2);
+		let account = pqc_address(&k);
+		let payload = b"(call, extra, additional_signed) encoded".to_vec();
+
+		// Sign exactly what `PqcSignature::verify` reconstructs: TAG ‖ payload.
+		let mut signed = EXTRINSIC_DOMAIN_TAG.to_vec();
+		signed.extend_from_slice(&payload);
+		let signature = sign_message(&signed, &k).expect("sign");
+		let pub_key = k.public_key().to_bytes();
+
+		let sig = PqcSignature::new(pub_key, signature);
+
+		assert!(sig.verify(&payload[..], &account), "valid signature authenticates signer");
+
+		// Wrong signer.
+		let other = pqc_address(&pqc_key(3));
+		assert!(!sig.verify(&payload[..], &other), "wrong signer rejected");
+
+		// Tampered signature.
+		let mut bad = sig.clone();
+		bad.signature[0] ^= 0xFF;
+		assert!(!bad.verify(&payload[..], &account), "tampered signature rejected");
+
+		// Signature made WITHOUT the domain tag must not authenticate (cross-path).
+		let plain = sign_message(&payload, &k).expect("sign");
+		let no_tag = PqcSignature::new(k.public_key().to_bytes(), plain);
+		assert!(!no_tag.verify(&payload[..], &account), "missing domain tag rejected");
+	}
+
+	/// Wrong-length public key / signature are rejected by the cheap pre-check.
+	#[test]
+	fn pqc_signature_rejects_malformed_lengths() {
+		let k = pqc_key(4);
+		let account = pqc_address(&k);
+		let short = PqcSignature::new(vec![0u8; 10], vec![0u8; 10]);
+		assert!(!short.verify(&b"x"[..], &account));
 	}
 }

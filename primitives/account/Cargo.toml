@@ -23,7 +23,14 @@ sp-runtime = { workspace = true }
 # Polkadot / XCM
 xcm = { workspace = true }
 
+# BlackChain PQC verification. `fp-blackchain-crypto` is the std-only native path;
+# `pallet-ethereum-blackchain-hf` is the WASM path (no_std extern stub → host fn),
+# exactly as pallet-blackchain-sudo wires them.
+fp-blackchain-crypto = { workspace = true, optional = true }
+pallet-ethereum-blackchain-hf = { workspace = true, default-features = false }
+
 [dev-dependencies]
+blackchain-crypto-lib-rust = { git = "https://github.com/Tycoonz-Solutions/blackchain-crypto-lib-rust-fixed.git", tag = "v0.1.1" }
 
 [features]
 default = ["std"]
@@ -39,6 +46,10 @@ std = [
 	"sp-io/std",
 	"sp-runtime/std",
 	"xcm/std",
+	# BlackChain PQC
+	"fp-blackchain-crypto",
+	"fp-blackchain-crypto/std",
+	"pallet-ethereum-blackchain-hf/std",
 ]
 serde = [
 	"dep:serde",

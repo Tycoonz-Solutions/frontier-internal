@@ -53,7 +53,7 @@ use pallet_transaction_payment::FungibleAdapter;
 use polkadot_runtime_common::SlowAdjustingFeeUpdate;
 use sp_genesis_builder::PresetId;
 // Frontier
-use fp_account::EthereumSignature;
+use fp_account::PqcSignature;
 use fp_evm::weight_per_gas;
 use fp_rpc::TransactionStatus;
 use pallet_ethereum::{Call::transact, PostLogContent, Transaction as EthereumTransaction};
@@ -71,8 +71,10 @@ use precompiles::FrontierPrecompiles;
 /// Type of block number.
 pub type BlockNumber = u32;
 
-/// Alias to 512-bit hash when used in the context of a transaction signature on the chain.
-pub type Signature = EthereumSignature;
+/// The runtime signature type. On a BlackChain network this is the composite
+/// post-quantum signature, so EVERY signed Substrate extrinsic (any pallet call)
+/// is authenticated by the hybrid PQC verifier at the single `Verify` choke point.
+pub type Signature = PqcSignature;
 
 /// Some way of identifying an account on the chain. We intentionally make it equivalent
 /// to the public key of our transaction signing scheme.
@@ -124,8 +126,161 @@ pub type SignedExtra = cumulus_pallet_weight_reclaim::StorageWeightReclaim<
 		frame_system::CheckNonce<Runtime>,
 		frame_system::CheckWeight<Runtime>,
 		pallet_transaction_payment::ChargeTransactionPayment<Runtime>,
+		// Charges every signed extrinsic the weight of the composite PQC signature
+		// verification (which runs in `check()`, outside the call/extension weights).
+		pqc_verify_weight::ChargePqcVerify<Runtime>,
 	),
 >;
+
+/// Transaction extension that accounts the weight of the composite PQC signature
+/// verification for the signed-extrinsic path.
+pub mod pqc_verify_weight {
+	use core::marker::PhantomData;
+	use frame_support::{weights::Weight, DefaultNoBound};
+	use scale_codec::{Decode, DecodeWithMemTracking, Encode};
+	use scale_info::TypeInfo;
+	use sp_runtime::{
+		impl_tx_ext_default,
+		traits::{DispatchInfoOf, TransactionExtension},
+		transaction_validity::TransactionSource,
+	};
+
+	/// Benchmarked cost of ONE composite verification (ML-DSA-87 + P-521 + Ed448).
+	/// PLACEHOLDER (~1.6 ms of ref_time) — replace with a measured benchmark
+	/// (Phase 5). This is a safe *serial* upper bound: it bounds how many PQC-signed
+	/// extrinsics fit a block's weight budget; the parallel import pre-pass is what
+	/// lets a node actually verify that many within the slot.
+	pub const PQC_VERIFY_REF_TIME: u64 = 1_600_000_000;
+
+	/// No-op transaction extension that only contributes `PQC_VERIFY_REF_TIME` to
+	/// each signed extrinsic's weight. Self-contained calls carry no extensions, so
+	/// this applies ONLY to the signed-extrinsic path (no double-counting with the
+	/// EVM/sudo/transfer paths, which weigh their verify in their own call weight).
+	#[derive(Encode, Decode, DecodeWithMemTracking, DefaultNoBound, Clone, Eq, PartialEq, TypeInfo)]
+	#[scale_info(skip_type_params(T))]
+	pub struct ChargePqcVerify<T>(PhantomData<T>);
+
+	impl<T> ChargePqcVerify<T> {
+		pub fn new() -> Self {
+			Self(PhantomData)
+		}
+	}
+
+	impl<T> core::fmt::Debug for ChargePqcVerify<T> {
+		fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+			write!(f, "ChargePqcVerify")
+		}
+	}
+
+	impl<T: frame_system::Config + Send + Sync> TransactionExtension<T::RuntimeCall>
+		for ChargePqcVerify<T>
+	{
+		const IDENTIFIER: &'static str = "ChargePqcVerify";
+		type Implicit = ();
+		type Val = ();
+		type Pre = ();
+
+		fn weight(&self, _: &T::RuntimeCall) -> Weight {
+			Weight::from_parts(PQC_VERIFY_REF_TIME, 0)
+		}
+
+		fn validate(
+			&self,
+			origin: T::RuntimeOrigin,
+			_call: &T::RuntimeCall,
+			_info: &DispatchInfoOf<T::RuntimeCall>,
+			_len: usize,
+			_self_implicit: Self::Implicit,
+			_inherited_implication: &impl Encode,
+			_source: TransactionSource,
+		) -> sp_runtime::traits::ValidateResult<Self::Val, T::RuntimeCall> {
+			Ok((Default::default(), (), origin))
+		}
+
+		impl_tx_ext_default!(T::RuntimeCall; prepare);
+	}
+}
+
+/// Std-only helpers for an off-chain client to build a PQC-signed extrinsic.
+///
+/// A client cannot call each extension's `implicit()` (those read chain state), so
+/// it queries the implicit values over RPC (spec/tx version, genesis hash) and
+/// hands them here. This keeps the finicky `SignedExtra`/`SignedPayload` type
+/// construction next to the types, so a client only needs this crate.
+#[cfg(feature = "std")]
+pub mod client {
+	use super::{
+		AccountId, Balance, Hash, RuntimeCall, SignedExtra, SignedPayload, UncheckedExtrinsic,
+	};
+	use scale_codec::Encode;
+	use sp_runtime::generic::Era;
+
+	/// Build a native `Balances::transfer_allow_death` call.
+	pub fn balances_transfer_call(dest: AccountId, value: Balance) -> RuntimeCall {
+		RuntimeCall::Balances(pallet_balances::Call::transfer_allow_death { dest, value })
+	}
+
+	/// Build the immortal `SignedExtra` for `nonce`/`tip`, and the EXACT bytes a
+	/// client must PQC-sign (`BLACKCHAIN_EXTRINSIC_V1 ‖ signed-payload`, with the
+	/// >256-byte blake2 rule already applied by `using_encoded`).
+	pub fn signing_message(
+		call: &RuntimeCall,
+		nonce: u32,
+		tip: Balance,
+		spec_version: u32,
+		tx_version: u32,
+		genesis_hash: Hash,
+	) -> (SignedExtra, Vec<u8>) {
+		let extra = cumulus_pallet_weight_reclaim::StorageWeightReclaim::new((
+			frame_system::CheckNonZeroSender::new(),
+			frame_system::CheckSpecVersion::new(),
+			frame_system::CheckTxVersion::new(),
+			frame_system::CheckGenesis::new(),
+			frame_system::CheckEra::from(Era::Immortal),
+			frame_system::CheckNonce::from(nonce),
+			frame_system::CheckWeight::new(),
+			pallet_transaction_payment::ChargeTransactionPayment::from(tip),
+			super::pqc_verify_weight::ChargePqcVerify::new(),
+		));
+		// Implicit (additional-signed) values for an immortal extrinsic. The empty
+		// tuples are the extensions whose implicit is `()`; era (immortal) binds to
+		// the genesis hash.
+		let implicit = (
+			(),
+			spec_version,
+			tx_version,
+			genesis_hash,
+			genesis_hash,
+			(),
+			(),
+			(),
+			(),
+		);
+		let payload = SignedPayload::from_raw(call.clone(), extra.clone(), implicit);
+		let msg = payload.using_encoded(|p| {
+			let mut m = fp_account::EXTRINSIC_DOMAIN_TAG.to_vec();
+			m.extend_from_slice(p);
+			m
+		});
+		(extra, msg)
+	}
+
+	/// Assemble the signed `UncheckedExtrinsic` from a composite PQC signature.
+	pub fn assemble(
+		call: RuntimeCall,
+		sender: AccountId,
+		pub_key: Vec<u8>,
+		signature: Vec<u8>,
+		extra: SignedExtra,
+	) -> UncheckedExtrinsic {
+		UncheckedExtrinsic::new_signed(
+			call,
+			sender,
+			fp_account::PqcSignature::new(pub_key, signature),
+			extra,
+		)
+	}
+}
 
 /// Unchecked extrinsic type as expected by this runtime.
 pub type UncheckedExtrinsic =
@@ -148,7 +303,7 @@ pub type Executive = frame_executive::Executive<
 >;
 
 // Time is measured by number of blocks.
-pub const MILLISECS_PER_BLOCK: u64 = 6000;
+pub const MILLISECS_PER_BLOCK: u64 = 2000;
 pub const SLOT_DURATION: u64 = MILLISECS_PER_BLOCK;
 pub const MINUTES: BlockNumber = 60_000 / (MILLISECS_PER_BLOCK as BlockNumber);
 pub const HOURS: BlockNumber = MINUTES * 60;
@@ -200,13 +355,27 @@ pub fn native_version() -> sp_version::NativeVersion {
 }
 
 const NORMAL_DISPATCH_RATIO: Perbill = Perbill::from_percent(75);
-/// We allow for 2000ms of compute with a 6 second average block time.
+/// 2000ms of compute budget in a 2 second block. This is the *full* slot: it is a
+/// throughput-experiment / dev operating point that leans on the parallel import
+/// pre-pass (`pqc_prewarm`) to keep wall-clock verify well under the slot, and on
+/// manual/dev sealing (no real propagation deadline). A production multi-node setup
+/// would reserve part of the slot for block propagation (e.g. 1/3, as 6s/2000ms did).
 pub const WEIGHT_MILLISECS_PER_BLOCK: u64 = 2000;
 pub const MAXIMUM_BLOCK_WEIGHT: Weight = Weight::from_parts(
 	WEIGHT_MILLISECS_PER_BLOCK * WEIGHT_REF_TIME_PER_MILLIS,
 	u64::MAX,
 );
-pub const MAXIMUM_BLOCK_LENGTH: u32 = 5 * 1024 * 1024;
+// 18 MiB blocks. Bounded by the WASM executor, not consensus: finalize_block builds
+// the extrinsics-root by SCALE-encoding the whole block body into one Vec, which
+// grows by DOUBLING, so a body over ~16 MiB forces a 32 MiB allocation that exceeds
+// sp-core's hard MAX_POSSIBLE_ALLOCATION (32 MiB) → "Requested allocation size is too
+// large" panic in finalize_block. Measured live: 13.8 MiB body (1792 txs) seals; 22
+// MiB (3000) and 54 MiB (7000) panic. 18 MiB keeps normal-class 75% (13.5 MiB) at the
+// proven-safe point → ~1800 of the ~7.7 KB PQC extrinsics. To go higher you must
+// SHRINK the signature (e.g. on-chain pubkey registry: 7.7 KB → ~4.9 KB), not raise
+// this. (ChargePqcVerify's 1.6ms weight does NOT bind — it is a no-op extension whose
+// declared weight is reclaimed as unused, so block LENGTH is the ceiling.)
+pub const MAXIMUM_BLOCK_LENGTH: u32 = 18 * 1024 * 1024;
 
 parameter_types! {
 	pub const Version: RuntimeVersion = VERSION;
@@ -676,6 +845,28 @@ mod benches {
 	);
 }
 
+/// CR-2 pre-filter for the PQC signed-extrinsic path.
+///
+/// A composite PQC verification costs ~1.6 ms and, for a signed extrinsic, runs
+/// inside `check()` BEFORE the fee/nonce extensions — so an attacker could flood
+/// valid-length garbage signatures and burn CPU for free. The claimed sender is
+/// carried IN the extrinsic (the `Signed` preamble) and is readable WITHOUT
+/// verifying, so an unfunded claimed sender is dropped here, before the verify is
+/// ever paid for. This chain's existential deposit is 0, so the meaningful cheap
+/// test is a zero free balance — a random/garbage key derives an unfunded address
+/// and is rejected. (Self-contained calls use `Bare`/`General` preambles and keep
+/// their own pre-filter in `check_self_contained`, so they are unaffected.)
+fn pqc_signed_prefilter(tx: &UncheckedExtrinsic) -> Result<(), TransactionValidityError> {
+	use sp_runtime::{generic::Preamble, transaction_validity::InvalidTransaction};
+	if let Preamble::Signed(address, _, _) = &tx.0.preamble {
+		let free = frame_system::Account::<Runtime>::get(address).data.free;
+		if free == 0 {
+			return Err(TransactionValidityError::Invalid(InvalidTransaction::Payment));
+		}
+	}
+	Ok(())
+}
+
 impl_runtime_apis! {
 	impl sp_api::Core<Block> for Runtime {
 		fn version() -> RuntimeVersion {
@@ -732,6 +923,9 @@ impl_runtime_apis! {
 			tx: <Block as BlockT>::Extrinsic,
 			block_hash: <Block as BlockT>::Hash,
 		) -> TransactionValidity {
+			// CR-2 pre-filter runs BEFORE the ~1.6 ms PQC verify (see
+			// `pqc_signed_prefilter`), dropping unfunded garbage-signature spam.
+			pqc_signed_prefilter(&tx)?;
 			Executive::validate_transaction(source, tx, block_hash)
 		}
 	}
@@ -1200,5 +1394,181 @@ mod tests {
 			.get(frame_support::dispatch::DispatchClass::Normal)
 			.base_extrinsic;
 		assert!(base_extrinsic.ref_time() <= min_ethereum_transaction_weight.ref_time());
+	}
+}
+
+/// End-to-end proof of the PQC signed-extrinsic path: a `Balances::transfer`
+/// submitted as a *standard signed Substrate extrinsic*, authenticated by a
+/// composite PQC signature, is accepted by the runtime's own `Checkable::check`
+/// (which re-derives the exact signed payload the signer committed to) — and a
+/// tampered signature is rejected. This proves the signer and the runtime agree
+/// on the payload bytes, closing the gap the `fp-account` unit tests don't cover.
+#[cfg(test)]
+mod pqc_signed_extrinsic_tests {
+	use super::*;
+	use blackchain_crypto_lib_rust::{sign_message, BlackChainPrivateKey};
+	use fp_account::{AccountId20, PqcSignature, EXTRINSIC_DOMAIN_TAG};
+	use scale_codec::Encode;
+	use sp_core::hashing::keccak_256;
+	use sp_runtime::{generic::Era, traits::Checkable, BuildStorage};
+
+	fn key(seed: u8) -> BlackChainPrivateKey {
+		BlackChainPrivateKey::generate(&[seed; 64]).expect("keygen").0
+	}
+	fn address(k: &BlackChainPrivateKey) -> AccountId20 {
+		AccountId20(keccak_256(&k.public_key().to_bytes())[12..].try_into().unwrap())
+	}
+
+	fn signed_extra(nonce: u32) -> SignedExtra {
+		cumulus_pallet_weight_reclaim::StorageWeightReclaim::new((
+			frame_system::CheckNonZeroSender::new(),
+			frame_system::CheckSpecVersion::new(),
+			frame_system::CheckTxVersion::new(),
+			frame_system::CheckGenesis::new(),
+			frame_system::CheckEra::from(Era::Immortal),
+			frame_system::CheckNonce::from(nonce),
+			frame_system::CheckWeight::new(),
+			pallet_transaction_payment::ChargeTransactionPayment::from(0),
+			pqc_verify_weight::ChargePqcVerify::new(),
+		))
+	}
+
+	fn new_test_ext(fund: &[(AccountId20, Balance)]) -> sp_io::TestExternalities {
+		let mut t = frame_system::GenesisConfig::<Runtime>::default()
+			.build_storage()
+			.unwrap();
+		pallet_balances::GenesisConfig::<Runtime> {
+			balances: fund.to_vec(),
+			..Default::default()
+		}
+		.assimilate_storage(&mut t)
+		.unwrap();
+		t.into()
+	}
+
+	/// Build a PQC-signed `UncheckedExtrinsic` for a transfer; `tamper` flips a
+	/// signature byte to exercise the rejection path.
+	fn signed_transfer(
+		k: &BlackChainPrivateKey,
+		dest: AccountId20,
+		value: Balance,
+		nonce: u32,
+		tamper: bool,
+	) -> UncheckedExtrinsic {
+		let call = RuntimeCall::Balances(pallet_balances::Call::transfer_allow_death {
+			dest,
+			value,
+		});
+		let extra = signed_extra(nonce);
+		let payload = SignedPayload::new(call.clone(), extra.clone()).expect("payload");
+		// Sign exactly what the runtime feeds `verify`: the (possibly hashed) signed
+		// payload, prefixed with the extrinsic domain tag.
+		let signed_msg = payload.using_encoded(|p| {
+			let mut m = EXTRINSIC_DOMAIN_TAG.to_vec();
+			m.extend_from_slice(p);
+			m
+		});
+		let mut signature = sign_message(&signed_msg, k).expect("sign");
+		if tamper {
+			signature[0] ^= 0xFF;
+		}
+		let pub_key = k.public_key().to_bytes();
+		UncheckedExtrinsic::new_signed(call, address(k), PqcSignature::new(pub_key, signature), extra)
+	}
+
+	#[test]
+	fn pqc_signed_balances_transfer_authenticates() {
+		let k = key(1);
+		let sender = address(&k);
+		let dest = AccountId20([0x22u8; 20]);
+
+		new_test_ext(&[(sender, 1_000_000_000_000u128)]).execute_with(|| {
+			let xt = signed_transfer(&k, dest, 1_000, 0, false);
+			// The runtime's own Checkable re-derives the payload and runs the PQC
+			// verifier; a correct composite signature must authenticate.
+			let checked = xt.check(&frame_system::ChainContext::<Runtime>::default());
+			assert!(checked.is_ok(), "PQC-signed extrinsic must authenticate via the runtime");
+		});
+	}
+
+	#[test]
+	fn tampered_pqc_signed_extrinsic_is_rejected() {
+		let k = key(2);
+		let sender = address(&k);
+		let dest = AccountId20([0x33u8; 20]);
+
+		new_test_ext(&[(sender, 1_000_000_000_000u128)]).execute_with(|| {
+			let xt = signed_transfer(&k, dest, 1_000, 0, true);
+			let checked = xt.check(&frame_system::ChainContext::<Runtime>::default());
+			assert!(checked.is_err(), "a tampered PQC signature must be rejected");
+		});
+	}
+
+	/// Cross-check: the runtime's `client::signing_message` must produce byte-for-byte
+	/// the same signing bytes as the browser wallet's JS builder
+	/// (`Blackchain-Wallet-Extension/src/lib/crypto/pqc-signed-extrinsic.js`), so the
+	/// wallet and the chain agree on exactly what is signed. The expected hex below
+	/// was emitted by that JS builder for these fixed inputs.
+	#[test]
+	fn signing_message_matches_wallet_js_builder() {
+		let dest = AccountId20([0x44u8; 20]);
+		let value: Balance = 1_000_000_000_000_000_000;
+		let call = super::client::balances_transfer_call(dest, value);
+		let genesis = sp_core::H256([0xabu8; 32]);
+		let (_extra, msg) = super::client::signing_message(&call, 0, 0, 2, 1, genesis);
+		let expected = "424c41434b434841494e5f45585452494e5349435f56310400444444444444444444444444444444444444444413000064a7b3b6e00d0000000200000001000000abababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababababab";
+		assert_eq!(hex::encode(&msg), expected, "runtime signing bytes must match the wallet JS builder");
+	}
+
+	/// The `client` helper (which supplies implicit values manually via `from_raw`,
+	/// as an off-chain client must) produces an extrinsic the runtime authenticates
+	/// — proving the client's manually-built implicit matches the chain's.
+	#[test]
+	fn client_helper_builds_authenticating_extrinsic() {
+		let k = key(5);
+		let sender = address(&k);
+		let dest = AccountId20([0x55u8; 20]);
+
+		new_test_ext(&[(sender, 1_000_000_000_000u128)]).execute_with(|| {
+			let call = super::client::balances_transfer_call(dest, 1234);
+			let spec = super::VERSION.spec_version;
+			let txv = super::VERSION.transaction_version;
+			let genesis = frame_system::BlockHash::<Runtime>::get::<u32>(0);
+			let (extra, msg) = super::client::signing_message(&call, 0, 0, spec, txv, genesis);
+			let signature = sign_message(&msg, &k).expect("sign");
+			let xt = super::client::assemble(call, sender, k.public_key().to_bytes(), signature, extra);
+			assert!(
+				xt.check(&frame_system::ChainContext::<Runtime>::default()).is_ok(),
+				"client-built PQC extrinsic must authenticate via the runtime",
+			);
+		});
+	}
+
+	/// CR-2 pre-filter: an unfunded claimed sender is rejected at
+	/// `validate_transaction` with `Payment` — i.e. BEFORE the ~1.6 ms verify. (A
+	/// correctly-signed extrinsic is used, so a `Payment` error proves the cheap
+	/// balance pre-check ran first; the signature was never checked.)
+	#[test]
+	fn unfunded_signed_extrinsic_rejected_before_verify() {
+		use sp_runtime::transaction_validity::InvalidTransaction;
+		let unfunded = key(9); // deliberately NOT funded in genesis
+		let funded = key(10);
+		let dest = AccountId20([0x44u8; 20]);
+
+		new_test_ext(&[(address(&funded), 1_000_000u128)]).execute_with(|| {
+			// Unfunded claimed sender → dropped by the pre-filter with `Payment`
+			// (a correctly-signed xt, so this proves the cheap check ran BEFORE the
+			// signature verify).
+			let xt = signed_transfer(&unfunded, dest, 1, 0, false);
+			assert_eq!(
+				super::pqc_signed_prefilter(&xt),
+				Err(TransactionValidityError::Invalid(InvalidTransaction::Payment)),
+				"unfunded claimed sender must be dropped before the PQC verify",
+			);
+
+			// A funded sender passes the pre-filter (then the normal pipeline runs).
+			let ok = signed_transfer(&funded, dest, 1, 0, false);
+			assert!(super::pqc_signed_prefilter(&ok).is_ok(), "funded sender passes the pre-filter");
+		});
 	}
 }

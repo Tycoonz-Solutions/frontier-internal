@@ -78,6 +78,13 @@ cumulus-pallet-weight-reclaim = { workspace = true }
 [build-dependencies]
 substrate-wasm-builder = { workspace = true, optional = true }
 
+[dev-dependencies]
+# Native PQC signing so the signed-extrinsic integration test can produce a real
+# composite signature the runtime's Checkable verifies.
+blackchain-crypto-lib-rust = { git = "https://github.com/Tycoonz-Solutions/blackchain-crypto-lib-rust-fixed.git", tag = "v0.1.1" }
+sp-io = { workspace = true, features = ["default"] }
+hex = { workspace = true, features = ["std"] }
+
 [features]
 default = ["std", "with-paritydb-weights"]
 with-rocksdb-weights = []
