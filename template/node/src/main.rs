@@ -16,6 +16,7 @@ mod cli;
 mod client;
 mod command;
 mod eth;
+mod pqc_prewarm;
 mod rpc;
 mod service;
 

@@ -44,6 +44,7 @@ members = [
 	"primitives/blackchain-rpc",
 	"template/node",
 	"template/runtime",
+	"tools/pqc-signed-submit",
 	"precompiles",
 	"precompiles/macro",
 	"precompiles/tests-external",
@@ -86,6 +87,7 @@ parity-db = "0.5.4"
 parking_lot = "0.12.3"
 proc-macro2 = "1.0.101"
 quote = "1.0.38"
+rayon = "1.10"
 rlp = { version = "0.6", default-features = false }
 scale-codec = { package = "parity-scale-codec", version = "3.7.5", default-features = false, features = ["derive"] }
 scale-info = { version = "2.11.6", default-features = false, features = ["derive"] }
